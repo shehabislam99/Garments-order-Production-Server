@@ -1,0 +1,4 @@
+node_modules
+.env
+Product-Tracker-sdk.json
+.vercel
