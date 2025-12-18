@@ -925,15 +925,74 @@ async function run() {
       }
     );
 
-     app.post("/orders", async (req, res) => {
-       const order = req.body;
-       order.status = "pending";
-       order.createdAt = new Date();
+      app.post("/orders", async (req, res) => {
+        try {
+          const order = req.body;
 
-       const result = await orderCollection.insertOne(order);
-       res.send(result);
-     });
-     
+          // Generate order ID
+          const orderId = `ORD-${Date.now()
+            .toString()
+            .substring(5)}-${Math.random()
+            .toString(36)
+            .substring(2, 8)
+            .toUpperCase()}`;
+
+          // Generate tracking number
+          const trackingNumber = `TRK-${Date.now()
+            .toString()
+            .substring(5)}-${Math.random()
+            .toString(36)
+            .substring(2, 6)
+            .toUpperCase()}`;
+
+          const orderData = {
+            ...order,
+            orderId: orderId,
+            trackingNumber: trackingNumber,
+            status: "pending",
+            paymentStatus: order.paymentStatus || "pending",
+            carrier: "Express Logistics",
+            currentLocation: {
+              city: "Dhaka",
+              country: "Bangladesh",
+              latitude: 23.8103,
+              longitude: 90.4125,
+            },
+            estimatedDelivery: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000), // 7 days from now
+            trackingHistory: [],
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          };
+
+          const result = await orderCollection.insertOne(orderData);
+
+          // Create initial tracking log
+          await trackingCollection.insertOne({
+            orderId: result.insertedId,
+            trackingId: trackingNumber,
+            status: "order_created",
+            details: "Order placed successfully",
+            location: { city: "Dhaka", country: "Bangladesh" },
+            createdAt: new Date(),
+          });
+
+          res.status(201).json({
+            success: true,
+            message: "Order created successfully",
+            data: {
+              ...orderData,
+              _id: result.insertedId,
+            },
+          });
+        } catch (error) {
+          console.error("Error creating order:", error);
+          res.status(500).json({
+            success: false,
+            message: "Failed to create order",
+          });
+        }
+      });
+
     // Get Buyer orders with pagination and filters
     app.get("/my-orders", verifyFBToken, async (req, res) => {
       try {
@@ -1318,7 +1377,7 @@ async function run() {
       return res.send({ success: false });
     });
 
-    // payment 
+    // payment
     app.get("/payments", verifyFBToken, async (req, res) => {
       const email = req.query.email;
       const query = {};
@@ -1388,41 +1447,60 @@ async function run() {
       res.send(result);
     });
 
-
-    // tracking 
+    // tracking
+    // Order Tracking Routes
+    // Get order tracking details with full tracking history
     app.get("/track-order/:orderId", verifyFBToken, async (req, res) => {
       try {
         const { orderId } = req.params;
         const email = req.decoded_email;
 
-        // Find the order
+        // Find order by orderId or _id
         const order = await orderCollection.findOne({
-          _id: new ObjectId(orderId),
+          $or: [{ _id: new ObjectId(orderId) }, { orderId: orderId }],
           "user.email": email,
         });
 
         if (!order) {
           return res.status(404).json({
             success: false,
-            message: "Order not found or unauthorized",
+            message: "Order not found",
           });
         }
 
-        // Get tracking history for this order
-        const trackingHistory = await trackingCollection
-          .find({ orderId: new ObjectId(orderId) })
-          .sort({ createdAt: 1 })
-          .toArray();
+        // Generate tracking history based on order status
+        const trackingHistory = generateTrackingHistory(order);
 
-        // Calculate estimated delivery
-        const estimatedDelivery = new Date(order.createdAt);
-        estimatedDelivery.setDate(estimatedDelivery.getDate() + 7); // Add 7 days for delivery
+        // Calculate estimated delivery if not set
+        let estimatedDelivery = order.estimatedDelivery;
+        if (!estimatedDelivery) {
+          estimatedDelivery = new Date(order.createdAt);
+          estimatedDelivery.setDate(estimatedDelivery.getDate() + 7); // Default 7 days
+        }
 
-        // Get current location (latest tracking update)
-        const currentLocation =
-          trackingHistory.length > 0
-            ? trackingHistory[trackingHistory.length - 1].location
-            : null;
+        // Get current location from tracking or order
+        let currentLocation = order.currentLocation;
+        if (
+          !currentLocation &&
+          order.trackingHistory &&
+          order.trackingHistory.length > 0
+        ) {
+          const lastUpdate =
+            order.trackingHistory[order.trackingHistory.length - 1];
+          currentLocation = lastUpdate.location;
+        }
+
+        // Generate tracking number if not exists
+        let trackingNumber = order.trackingNumber;
+        if (!trackingNumber) {
+          trackingNumber = `TRK-${order._id
+            .toString()
+            .substring(0, 8)
+            .toUpperCase()}-${Date.now().toString().substring(8, 12)}`;
+        }
+
+        // Get carrier information
+        const carrier = order.carrier || "Express Logistics";
 
         res.status(200).json({
           success: true,
@@ -1431,6 +1509,8 @@ async function run() {
               ...order,
               estimatedDelivery,
               currentLocation,
+              trackingNumber,
+              carrier,
             },
             trackingHistory,
             statistics: {
@@ -1448,15 +1528,359 @@ async function run() {
           message: "Order tracking details fetched successfully",
         });
       } catch (error) {
-        console.error("Error fetching tracking details:", error);
+        console.error("Error fetching order tracking:", error);
         res.status(500).json({
           success: false,
-          message: "Failed to fetch order tracking information",
+          message: "Server error",
         });
       }
     });
 
-      //Profile           
+    // Update order tracking (for admin)
+    app.put(
+      "/track-order/update/:orderId",
+      verifyFBToken,
+      verifyAdmin,
+      async (req, res) => {
+        try {
+          const { orderId } = req.params;
+          const { status, location, description, step } = req.body;
+
+          // Find the order
+          const order = await orderCollection.findOne({
+            $or: [{ _id: new ObjectId(orderId) }, { orderId: orderId }],
+          });
+
+          if (!order) {
+            return res.status(404).json({
+              success: false,
+              message: "Order not found",
+            });
+          }
+
+          // Create tracking update object
+          const trackingUpdate = {
+            step: step || getStepFromStatus(status || order.status),
+            description: description || `Order ${status || "updated"}`,
+            location: location
+              ? `${location.city || "Unknown"}, ${
+                  location.country || "Unknown"
+                }`
+              : "Unknown",
+            status: "completed",
+            date: new Date(),
+            updatedBy: req.decoded_email,
+          };
+
+          // Prepare update data
+          const updateData = {
+            $set: {
+              updatedAt: new Date(),
+            },
+            $push: {
+              trackingHistory: trackingUpdate,
+            },
+          };
+
+          // Add status update if provided
+          if (status) {
+            updateData.$set.status = status;
+          }
+
+          // Add location update if provided
+          if (location) {
+            updateData.$set.currentLocation = location;
+          }
+
+          // Update the order
+          const result = await orderCollection.updateOne(
+            { _id: order._id },
+            updateData
+          );
+
+          // Create tracking log
+          await trackingCollection.insertOne({
+            orderId: order._id,
+            trackingId:
+              order.trackingNumber ||
+              `TRK-${order._id.toString().substring(0, 8)}`,
+            status: status || "tracking_updated",
+            details: description || `Tracking updated: ${step || status}`,
+            location: location || {},
+            updatedBy: req.decoded_email,
+            createdAt: new Date(),
+          });
+
+          // Get updated order
+          const updatedOrder = await orderCollection.findOne({
+            _id: order._id,
+          });
+
+          res.status(200).json({
+            success: true,
+            data: updatedOrder,
+            message: "Order tracking updated successfully",
+          });
+        } catch (error) {
+          console.error("Error updating tracking:", error);
+          res.status(500).json({
+            success: false,
+            message: "Server error",
+          });
+        }
+      }
+    );
+
+    // Get tracking timeline for an order
+    app.get(
+      "/track-order/:orderId/timeline",
+      verifyFBToken,
+      async (req, res) => {
+        try {
+          const { orderId } = req.params;
+          const email = req.decoded_email;
+
+          const order = await orderCollection.findOne({
+            $or: [{ _id: new ObjectId(orderId) }, { orderId: orderId }],
+            "user.email": email,
+          });
+
+          if (!order) {
+            return res.status(404).json({
+              success: false,
+              message: "Order not found",
+            });
+          }
+
+          // Get tracking logs
+          const trackingLogs = await trackingCollection
+            .find({
+              orderId: order._id,
+            })
+            .sort({ createdAt: 1 })
+            .toArray();
+
+          // Format timeline
+          const timeline = trackingLogs.map((log) => ({
+            id: log._id,
+            step: log.details,
+            description: log.details,
+            location: log.location?.city
+              ? `${log.location.city}, ${log.location.country}`
+              : "Unknown",
+            status:
+              log.status === "product_delivered"
+                ? "completed"
+                : log.status === "driver_assigned"
+                ? "current"
+                : "pending",
+            date: log.createdAt,
+            icon: getIconForStatus(log.status),
+          }));
+
+          res.status(200).json({
+            success: true,
+            data: timeline,
+            message: "Timeline fetched successfully",
+          });
+        } catch (error) {
+          console.error("Error fetching timeline:", error);
+          res.status(500).json({
+            success: false,
+            message: "Server error",
+          });
+        }
+      }
+    );
+
+    // Helper function to generate tracking history
+    function generateTrackingHistory(order) {
+      const steps = [
+        {
+          id: 1,
+          step: "Order Placed",
+          description: "Your order has been confirmed and payment received",
+          status: "completed",
+          icon: "FaClipboardCheck",
+          location: "Order Processing Center",
+          date: order.createdAt,
+        },
+        {
+          id: 2,
+          step: "Processing",
+          description: "Preparing your item for shipment",
+          status:
+            order.status === "processing"
+              ? "current"
+              : ["approved", "shipped", "delivered"].includes(order.status)
+              ? "completed"
+              : "pending",
+          icon: "FaWarehouse",
+          location: "Factory Warehouse",
+          date: new Date(order.createdAt.getTime() + 3600000), // 1 hour later
+        },
+        {
+          id: 3,
+          step: "Quality Check",
+          description: "Ensuring product meets quality standards",
+          status:
+            order.status === "processing"
+              ? "current"
+              : ["approved", "shipped", "delivered"].includes(order.status)
+              ? "completed"
+              : "pending",
+          icon: "FaCheckCircle",
+          location: "Quality Control",
+          date: new Date(order.createdAt.getTime() + 7200000), // 2 hours later
+        },
+        {
+          id: 4,
+          step: "Dispatched",
+          description: "Package handed over to delivery partner",
+          status:
+            order.status === "shipped"
+              ? "current"
+              : order.status === "delivered"
+              ? "completed"
+              : "pending",
+          icon: "FaTruck",
+          location: "Dispatch Center",
+          date: order.estimatedDelivery
+            ? new Date(order.estimatedDelivery.getTime() - 86400000) // 1 day before delivery
+            : new Date(order.createdAt.getTime() + 86400000), // 1 day later
+        },
+        {
+          id: 5,
+          step: "Out for Delivery",
+          description: "Package is on its way to your address",
+          status: order.status === "delivered" ? "completed" : "pending",
+          icon: "FaShippingFast",
+          location: "In Transit",
+          date: order.estimatedDelivery
+            ? new Date(order.estimatedDelivery.getTime() - 3600000) // 1 hour before delivery
+            : new Date(order.createdAt.getTime() + 172800000), // 2 days later
+        },
+        {
+          id: 6,
+          step: "Delivered",
+          description: "Package has been delivered successfully",
+          status: order.status === "delivered" ? "completed" : "pending",
+          icon: "FaBox",
+          location: order.shippingAddress
+            ? `${order.shippingAddress.city}, ${order.shippingAddress.country}`
+            : "Delivery Location",
+          date:
+            order.estimatedDelivery ||
+            new Date(order.createdAt.getTime() + 259200000), // 3 days later
+        },
+      ];
+
+      return steps;
+    }
+
+    // Helper function to get step from status
+    function getStepFromStatus(status) {
+      const stepMap = {
+        pending: "Order Placed",
+        processing: "Processing",
+        approved: "Processing",
+        shipped: "Dispatched",
+        delivered: "Delivered",
+        cancelled: "Cancelled",
+      };
+      return stepMap[status] || "Order Update";
+    }
+
+    // Helper function to get icon for status
+    function getIconForStatus(status) {
+      const iconMap = {
+        order_created: "FaClipboardCheck",
+        processing: "FaWarehouse",
+        quality_check: "FaCheckCircle",
+        driver_assigned: "FaTruck",
+        in_transit: "FaShippingFast",
+        product_delivered: "FaBox",
+        payment_received: "FaDollarSign",
+        cancelled: "FaTimesCircle",
+      };
+      return iconMap[status] || "FaInfoCircle";
+    }
+
+    // Get real-time location updates (for testing/demo)
+    app.get( "/track-order/:orderId/location",
+      verifyFBToken,
+      async (req, res) => {
+        try {
+          const { orderId } = req.params;
+          const email = req.decoded_email;
+
+          const order = await orderCollection.findOne({
+            $or: [{ _id: new ObjectId(orderId) }, { orderId: orderId }],
+            "user.email": email,
+          });
+
+          if (!order) {
+            return res.status(404).json({
+              success: false,
+              message: "Order not found",
+            });
+          }
+
+          // Mock location data - in real app, integrate with GPS/geolocation service
+          const mockLocations = [
+            {
+              city: "Dhaka",
+              country: "Bangladesh",
+              latitude: 23.8103,
+              longitude: 90.4125,
+            },
+            {
+              city: "Chittagong",
+              country: "Bangladesh",
+              latitude: 22.3569,
+              longitude: 91.7832,
+            },
+            {
+              city: "Sylhet",
+              country: "Bangladesh",
+              latitude: 24.9045,
+              longitude: 91.8611,
+            },
+            {
+              city: "Khulna",
+              country: "Bangladesh",
+              latitude: 22.8456,
+              longitude: 89.5403,
+            },
+          ];
+
+          // Get current location or generate random one
+          const currentLocation =
+            order.currentLocation ||
+            mockLocations[Math.floor(Math.random() * mockLocations.length)];
+
+          res.status(200).json({
+            success: true,
+            data: {
+              location: currentLocation,
+              lastUpdated: new Date(),
+              accuracy: "High",
+              speed: Math.random() * 60 + 20, // Mock speed in km/h
+              heading: Math.random() * 360, // Mock heading in degrees
+            },
+            message: "Location fetched successfully",
+          });
+        } catch (error) {
+          console.error("Error fetching location:", error);
+          res.status(500).json({
+            success: false,
+            message: "Failed to fetch location",
+          });
+        }
+      }
+    );
+
+    //Profile
     app.get("/auth/profile", verifyFBToken, async (req, res) => {
       const email = req.decoded_email;
 
