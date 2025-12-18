@@ -1158,4 +1158,106 @@ app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`📁 Uploads directory: ${path.join(__dirname, "uploads")}`);
   console.log(`🌐 Health check: http://localhost:${PORT}/api/health`);
+
+
+
 });
+
+
+
+
+  //   STATS MANAGEMENT WITH FILTERS, PAGINATION IN FRONTEND FRONTEND (FULL DATABASE)
+    app.get(
+      "/admin/manage-user/stats",
+      verifyFBToken,
+      verifyAdmin,
+      async (req, res) => {
+        try {
+          const stats = await userCollection
+            .aggregate([
+              {
+                $facet: {
+                  totalUsers: [{ $count: "count" }],
+
+                  roles: [
+                    {
+                      $addFields: {
+                        roleField: { $ifNull: ["$role", "buyer"] },
+                      },
+                    },
+                    {
+                      $group: {
+                        _id: "$roleField",
+                        count: { $sum: 1 },
+                      },
+                    },
+                  ],
+
+                  statuses: [
+                    {
+                      $addFields: {
+                        statusField: { $ifNull: ["$status", "pending"] },
+                      },
+                    },
+                    {
+                      $group: {
+                        _id: "$statusField",
+                        count: { $sum: 1 },
+                      },
+                    },
+                  ],
+                },
+              },
+            ])
+            .toArray();
+
+          const result = stats[0] || {};
+
+          // Initialize with default values
+          const roleCounts = {
+            admin: 0,
+            manager: 0,
+            buyer: 0,
+          };
+
+          const statusCounts = {
+            active: 0,
+            suspended: 0,
+            pending: 0,
+          };
+
+          // Map role counts
+          if (result.roles && Array.isArray(result.roles)) {
+            result.roles.forEach((r) => {
+              const role = r._id;
+              if (role && roleCounts.hasOwnProperty(role)) {
+                roleCounts[role] = r.count;
+              }
+            });
+          }
+
+          // Map status counts
+          if (result.statuses && Array.isArray(result.statuses)) {
+            result.statuses.forEach((s) => {
+              const status = s._id;
+              if (status && statusCounts.hasOwnProperty(status)) {
+                statusCounts[status] = s.count;
+              }
+            });
+          }
+
+          res.status(200).json({
+            success: true,
+            totalUsers: result.totalUsers?.[0]?.count || 0,
+            roles: roleCounts,
+            statuses: statusCounts,
+          });
+        } catch (error) {
+          console.error("Error fetching user stats:", error);
+          res.status(500).json({
+            success: false,
+            message: "Failed to fetch user statistics",
+          });
+        }
+      }
+    );
