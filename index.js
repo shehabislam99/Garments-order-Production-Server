@@ -20,14 +20,6 @@ admin.initializeApp({
 app.use(express.json());
 app.use(cors());
 
-// function generateTrackingId() {
-//   const prefix = "PRD"; // your brand prefix
-//   const date = new Date().toISOString().slice(0, 10).replace(/-/g, ""); // YYYYMMDD
-//   const random = crypto.randomBytes(3).toString("hex").toUpperCase(); // 6-char random hex
-
-//   return `${prefix}-${date}-${random}`;
-// }
-
 const verifyFBToken = async (req, res, next) => {
   const token = req.headers.authorization;
 
@@ -183,20 +175,19 @@ async function run() {
 
     // Generate tracking ID
     const generateTrackingId = () => {
-      const timestamp = Date.now().toString().slice(-6);
-      const random = Math.random().toString(36).substring(2, 6).toUpperCase();
+      const timestamp = new Date().toISOString().slice(0, 10).replace(/-/g, ""); 
+      const random = crypto.randomBytes(3).toString("hex").toUpperCase();
       return `TRK${timestamp}${random}`;
     };
 
     // POST /orders endpoint
     app.post("/orders", async (req, res) => {
       const orderData = req.body;
-
       const trackingId = generateTrackingId();
 
       let status = "pending";
       if (orderData.paymentMethod === "Stripe") {
-        status = "unpaid";
+        status = "paid";
       } else if (orderData.paymentMethod === "Cash on Delivery") {
         status = "cod";
       }
@@ -206,7 +197,7 @@ async function run() {
         trackingId,
         status: status,
         paymentStatus:
-          orderData.paymentMethod === "Stripe" ? "unpaid" : "pending",
+          orderData.paymentMethod === "Stripe" ? "paid" : "pending",
         createdAt: new Date(),
         updatedAt: new Date(),
       };
