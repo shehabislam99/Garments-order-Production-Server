@@ -20,13 +20,14 @@ admin.initializeApp({
 app.use(express.json());
 app.use(cors());
 
-function generateTrackingId() {
-  const prefix = "PRD"; // your brand prefix
-  const date = new Date().toISOString().slice(0, 10).replace(/-/g, ""); // YYYYMMDD
-  const random = crypto.randomBytes(3).toString("hex").toUpperCase(); // 6-char random hex
+// function generateTrackingId() {
+//   const prefix = "PRD"; // your brand prefix
+//   const date = new Date().toISOString().slice(0, 10).replace(/-/g, ""); // YYYYMMDD
+//   const random = crypto.randomBytes(3).toString("hex").toUpperCase(); // 6-char random hex
 
-  return `${prefix}-${date}-${random}`;
-}
+//   return `${prefix}-${date}-${random}`;
+// }
+
 const verifyFBToken = async (req, res, next) => {
   const token = req.headers.authorization;
 
@@ -65,7 +66,6 @@ async function run() {
     const orderCollection = db.collection("orders");
     const paymentCollection = db.collection("payment");
     const trackingCollection = db.collection("tracking");
-    const bookingCollection = db.collection("booking");
 
     // admin activity after verifyFBToken middleware
     const verifyAdmin = async (req, res, next) => {
@@ -101,6 +101,150 @@ async function run() {
       const result = await trackingCollection.insertOne(log);
       return result;
     };
+
+    // payment related
+    app.post("/payment-checkout-session", async (req, res) => {
+      const { orderamount, product_name, orderId, senderEmail, trackingId } =
+        req.body;
+
+      const session = await stripe.checkout.sessions.create({
+        payment_method_types: ["card"],
+        line_items: [
+          {
+            price_data: {
+              currency: "usd",
+              product_data: {
+                name: product_name,
+                description: `Tracking ID: ${trackingId}`,
+              },
+              unit_amount: Math.round(orderamount * 100),
+            },
+            quantity: 1,
+          },
+        ],
+        mode: "payment",
+        metadata: {
+          orderId,
+          trackingId,
+          productName: product_name,
+        },
+        customer_email: senderEmail,
+        success_url: `${process.env.CLIENT_URL}/payment-success?session_id={CHECKOUT_SESSION_ID}`,
+        cancel_url: `${process.env.CLIENT_URL}/payment-canceled`,
+      });
+
+      res.json({
+        success: true,
+        url: session.url,
+        sessionId: session.id,
+      });
+    });
+
+    app.get("/payment-success", async (req, res) => {
+      const sessionId = req.query.session_id;
+      const session = await stripe.checkout.sessions.retrieve(sessionId);
+
+      if (session.payment_status !== "paid") {
+        return res.status(400).json({
+          success: false,
+          message: "Payment not completed",
+        });
+      }
+
+      const transactionId = session.payment_intent;
+      const trackingId = session.metadata.trackingId;
+
+      const updateResult = await orderCollection.updateOne(
+        { trackingId },
+        {
+          $set: {
+            paymentStatus: "paid",
+            status: "confirmed",
+            transactionId,
+            paidAt: new Date(),
+            updatedAt: new Date(),
+          },
+        }
+      );
+
+      await paymentCollection.insertOne({
+        amount: session.amount_total / 100,
+        currency: session.currency,
+        customerEmail: session.customer_email,
+        transactionId,
+        paymentStatus: session.payment_status,
+        trackingId,
+        sessionId,
+        createdAt: new Date(),
+      });
+
+      res.redirect(`${process.env.CLIENT_URL}/dashboard/my-orders`);
+    });
+
+    // Generate tracking ID
+    const generateTrackingId = () => {
+      const timestamp = Date.now().toString().slice(-6);
+      const random = Math.random().toString(36).substring(2, 6).toUpperCase();
+      return `TRK${timestamp}${random}`;
+    };
+
+    // POST /orders endpoint
+    app.post("/orders", async (req, res) => {
+      const orderData = req.body;
+
+      const trackingId = generateTrackingId();
+
+      let status = "pending";
+      if (orderData.paymentMethod === "Stripe") {
+        status = "unpaid";
+      } else if (orderData.paymentMethod === "Cash on Delivery") {
+        status = "cod";
+      }
+
+      const order = {
+        ...orderData,
+        trackingId,
+        status: status,
+        paymentStatus:
+          orderData.paymentMethod === "Stripe" ? "unpaid" : "pending",
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+
+      const result = await orderCollection.insertOne(order);
+
+      res.status(201).json({
+        success: true,
+        order: {
+          _id: result.insertedId,
+          trackingId,
+          totalPrice: order.totalPrice,
+          paymentMethod: order.paymentMethod,
+          status: order.status,
+        },
+        message: "Order created successfully",
+      });
+    });
+
+    // get payments
+    app.get("/payments", verifyFBToken, async (req, res) => {
+      const email = req.query.email;
+      const query = {};
+
+      // console.log( 'headers', req.headers);
+
+      if (email) {
+        query.customerEmail = email;
+
+        // check email address
+        if (email !== req.decoded_email) {
+          return res.status(403).send({ message: "forbidden access" });
+        }
+      }
+      const cursor = paymentCollection.find(query).sort({ paidAt: -1 });
+      const result = await cursor.toArray();
+      res.send(result);
+    });
 
     //user post in database
     app.post("/users", async (req, res) => {
@@ -161,82 +305,81 @@ async function run() {
 
     //   STATS MANAGEMENT WITH FILTERS, PAGINATION IN FRONTEND FRONTEND (FULL DATABASE)
     app.get("/users/stats", verifyFBToken, async (req, res) => {
-    
-        const stats = await userCollection
-          .aggregate([
-            {
-              $facet: {
-                totalUsers: [{ $count: "count" }],
+      const stats = await userCollection
+        .aggregate([
+          {
+            $facet: {
+              totalUsers: [{ $count: "count" }],
 
-                roles: [
-                  {
-                    $addFields: {
-                      roleField: { $ifNull: ["$role", "buyer"] },
-                    },
+              roles: [
+                {
+                  $addFields: {
+                    roleField: { $ifNull: ["$role", "buyer"] },
                   },
-                  {
-                    $group: {
-                      _id: "$roleField",
-                      count: { $sum: 1 },
-                    },
+                },
+                {
+                  $group: {
+                    _id: "$roleField",
+                    count: { $sum: 1 },
                   },
-                ],
+                },
+              ],
 
-                statuses: [
-                  {
-                    $addFields: {
-                      statusField: { $ifNull: ["$status", "pending"] },
-                    },
+              statuses: [
+                {
+                  $addFields: {
+                    statusField: { $ifNull: ["$status", "pending"] },
                   },
-                  {
-                    $group: {
-                      _id: "$statusField",
-                      count: { $sum: 1 },
-                    },
+                },
+                {
+                  $group: {
+                    _id: "$statusField",
+                    count: { $sum: 1 },
                   },
-                ],
-              },
+                },
+              ],
             },
-          ])
-          .toArray();
+          },
+        ])
+        .toArray();
 
-        const result = stats[0] || {};
+      const result = stats[0] || {};
 
-        const roleCounts = {
-          admin: 0,
-          manager: 0,
-          buyer: 0,
-        };
+      const roleCounts = {
+        admin: 0,
+        manager: 0,
+        buyer: 0,
+      };
 
-        const statusCounts = {
-          active: 0,
-          suspended: 0,
-          pending: 0,
-        };
-        if (result.roles && Array.isArray(result.roles)) {
-          result.roles.forEach((r) => {
-            const role = r._id;
-            if (role && roleCounts.hasOwnProperty(role)) {
-              roleCounts[role] = r.count;
-            }
-          });
-        }
-
-        if (result.statuses && Array.isArray(result.statuses)) {
-          result.statuses.forEach((s) => {
-            const status = s._id;
-            if (status && statusCounts.hasOwnProperty(status)) {
-              statusCounts[status] = s.count;
-            }
-          });
-        }
-
-        res.status(200).json({
-          success: true,
-          totalUsers: result.totalUsers?.[0]?.count || 0,
-          roles: roleCounts,
-          statuses: statusCounts,
+      const statusCounts = {
+        active: 0,
+        suspended: 0,
+        pending: 0,
+      };
+      if (result.roles && Array.isArray(result.roles)) {
+        result.roles.forEach((r) => {
+          const role = r._id;
+          if (role && roleCounts.hasOwnProperty(role)) {
+            roleCounts[role] = r.count;
+          }
         });
+      }
+
+      if (result.statuses && Array.isArray(result.statuses)) {
+        result.statuses.forEach((s) => {
+          const status = s._id;
+          if (status && statusCounts.hasOwnProperty(status)) {
+            statusCounts[status] = s.count;
+          }
+        });
+      }
+
+      res.status(200).json({
+        success: true,
+        totalUsers: result.totalUsers?.[0]?.count || 0,
+        roles: roleCounts,
+        statuses: statusCounts,
+      });
     });
 
     //
@@ -332,61 +475,58 @@ async function run() {
       verifyFBToken,
       verifyAdmin,
       async (req, res) => {
-          const { range = "month" } = req.query;
-          let days;
-          switch (range) {
-            case "week":
-              days = 7;
-              break;
-            case "month":
-              days = 30;
-              break;
-            case "quarter":
-              days = 90;
-              break;
-            case "year":
-              days = 365;
-              break;
-            default:
-              days = 30;
-          }
+        const { range = "month" } = req.query;
+        let days;
+        switch (range) {
+          case "week":
+            days = 7;
+            break;
+          case "month":
+            days = 30;
+            break;
+          case "quarter":
+            days = 90;
+            break;
+          case "year":
+            days = 365;
+            break;
+          default:
+            days = 30;
+        }
 
-          const [totalOrders, totalProducts, totalRevenue] = await Promise.all([
-            orderCollection.countDocuments({}),
-            productCollection.countDocuments({}),
-            // Calculate total revenue from orders
-            orderCollection
-              .aggregate([
-                { $match: { status: "delivered" } },
-                { $group: { _id: null, total: { $sum: "$totalAmount" } } },
-              ])
-              .toArray(),
-          ]);
+        const [totalOrders, totalProducts, totalRevenue] = await Promise.all([
+          orderCollection.countDocuments({}),
+          productCollection.countDocuments({}),
+          // Calculate total revenue from orders
+          orderCollection
+            .aggregate([
+              { $match: { status: "delivered" } },
+              { $group: { _id: null, total: { $sum: "$totalAmount" } } },
+            ])
+            .toArray(),
+        ]);
 
-          const analyticsData = {
-            summary: {
-              totalRevenue: totalRevenue[0]?.total || 0,
-              totalOrders: totalOrders,
-              newCustomers: 0, 
-              productsSold: 0, 
-              avgOrderValue:
-                totalOrders > 0
-                  ? (totalRevenue[0]?.total || 0) / totalOrders
-                  : 0,
-              conversionRate: 0, 
-            },
-          }
+        const analyticsData = {
+          summary: {
+            totalRevenue: totalRevenue[0]?.total || 0,
+            totalOrders: totalOrders,
+            newCustomers: 0,
+            productsSold: 0,
+            avgOrderValue:
+              totalOrders > 0 ? (totalRevenue[0]?.total || 0) / totalOrders : 0,
+            conversionRate: 0,
+          },
+        };
 
-          res.status(200).json({
-            success: true,
-            data: analyticsData,
-            message: "Analytics data fetched successfully",
-          });
+        res.status(200).json({
+          success: true,
+          data: analyticsData,
+          message: "Analytics data fetched successfully",
+        });
       }
     );
 
-
-// PRODUCT POST  MANAGER TO FRONTEND
+    // PRODUCT POST  MANAGER TO FRONTEND
     app.post("/products", async (req, res) => {
       const product = req.body;
       const trackingId = generateTrackingId();
@@ -399,187 +539,186 @@ async function run() {
       res.send(result);
     });
 
-
     // PRODUCT WITH FILTERS, PAGINATION IN FRONTEND
     app.get("/products", async (req, res) => {
-        const {
-          searchText = "",
-          page = 1,
-          limit = 10,
-          category = "all",
-          status = "all",
-        } = req.query;
+      const {
+        searchText = "",
+        page = 1,
+        limit = 10,
+        category = "all",
+        status = "all",
+      } = req.query;
 
-      
-        const filterQuery = {
-          ...(searchText && {
-            $or: [
-              { product_name: { $regex: searchText, $options: "i" } },
-              { description: { $regex: searchText, $options: "i" } },
-              { category: { $regex: searchText, $options: "i" } },
-            ],
-          }),
-          ...(category !== "all" && { category }),
-          ...(status === "show" && { showOnHome: true }),
-          ...(status === "hide" && { showOnHome: false }),
-        };
+      const filterQuery = {
+        ...(searchText && {
+          $or: [
+            { product_name: { $regex: searchText, $options: "i" } },
+            { description: { $regex: searchText, $options: "i" } },
+            { category: { $regex: searchText, $options: "i" } },
+          ],
+        }),
+        ...(category !== "all" && { category }),
+        ...(status === "show" && { showOnHome: true }),
+        ...(status === "hide" && { showOnHome: false }),
+      };
 
-        const skip = (page - 1) * limit;
+      const skip = (page - 1) * limit;
 
-        const [products, total] = await Promise.all([
-          productCollection
-            .find(filterQuery)
-            .sort({ createdAt: -1 })
-            .skip(Number(skip))
-            .limit(Number(limit))
-            .toArray(),
+      const [products, total] = await Promise.all([
+        productCollection
+          .find(filterQuery)
+          .sort({ createdAt: -1 })
+          .skip(Number(skip))
+          .limit(Number(limit))
+          .toArray(),
 
-          productCollection.countDocuments(filterQuery),
-        ]);
+        productCollection.countDocuments(filterQuery),
+      ]);
 
-      
-        const formattedProducts = products.map((product) => ({
-          _id: product._id,
-          product_name: product.product_name,
-          price: product.price,
-          images: product.images,
-          category: product.category,
-          showOnHome: product.showOnHome || false,
-          payment_Options: product.payment_Options,
-          demo_video_link: product.demo_video_link,
-          available_quantity: product.available_quantity,
-        }));
+      const formattedProducts = products.map((product) => ({
+        _id: product._id,
+        product_name: product.product_name,
+        price: product.price,
+        images: product.images,
+        category: product.category,
+        showOnHome: product.showOnHome || false,
+        payment_Options: product.payment_Options,
+        demo_video_link: product.demo_video_link,
+        available_quantity: product.available_quantity,
+      }));
 
-        res.status(200).json({
-          success: true,
-          data: formattedProducts,
-          total: total,
-          page: parseInt(page),
-          totalPages: Math.ceil(total / parseInt(limit)),
-          limit: parseInt(limit),
-        });
+      res.status(200).json({
+        success: true,
+        data: formattedProducts,
+        total: total,
+        page: parseInt(page),
+        totalPages: Math.ceil(total / parseInt(limit)),
+        limit: parseInt(limit),
+      });
     });
 
     // get single product
-   app.get("/products/:id", async (req, res) => {
-     const product = await productCollection.findOne({
-       _id: new ObjectId(req.params.id),
-     });
+    app.get("/products/:id", async (req, res) => {
+      const product = await productCollection.findOne({
+        _id: new ObjectId(req.params.id),
+      });
 
-     if (!product) {
-       return res.status(404).json({ success: false });
-     }
+      if (!product) {
+        return res.status(404).json({ success: false });
+      }
 
-     const formattedProduct = {
-       _id: product._id,
-       product_name: product.product_name,
-       description: product.description,
-       price: product.price,
-       images: Array.isArray(product.images) ? product.images : [],
-       category: product.category,
-       payment_Options: Array.isArray(product.payment_Options)
-         ? product.payment_Options
-         : typeof product.payment_Options === "string"
-         ? product.payment_Options.split(",")
-         : [],
-       available_quantity: product.available_quantity,
-       moq: product.moq,
-     };
+      const formattedProduct = {
+        _id: product._id,
+        product_name: product.product_name,
+        description: product.description,
+        price: product.price,
+        images: Array.isArray(product.images) ? product.images : [],
+        category: product.category,
+        payment_Options: Array.isArray(product.payment_Options)
+          ? product.payment_Options
+          : typeof product.payment_Options === "string"
+          ? product.payment_Options.split(",")
+          : [],
+        available_quantity: product.available_quantity,
+        moq: product.moq,
+      };
 
-     res.json({
-       success: true,
-       data: formattedProduct,
-     });
-   });
+      res.json({
+        success: true,
+        data: formattedProduct,
+      });
+    });
 
-// get single booking
-app.get("/booking/:id", async (req, res) => {
-const booking = await productCollection.findOne({
-  _id: new ObjectId(req.params.id),
-});
+    // get single order
+    app.get("/order/:id", async (req, res) => {
+      const order = await productCollection.findOne({
+        _id: new ObjectId(req.params.id),
+      });
 
-if (!booking) {
-  return res.status(404).json({ success: false });
-}
+      if (!order) {
+        return res.status(404).json({ success: false });
+      }
 
-res.json({
-  success: true,
-  data: booking,
-});})
+      res.json({
+        success: true,
+        data: order,
+      });
+    });
 
-//post booking
-app.post("/booking", async (req, res) => {
- const bookingData = req.body;
+    //post order
+    // app.post("/orders", async (req, res) => {
+    //   const orderData = req.body;
+    //   const order = {
+    //     ...orderData,
+    //     trackingId,
+    //     status: orderData.paymentMethod === "Stripe" ? "unpaid" : "cod",
+    //     createdAt: new Date(),
+    //   };
 
- const booking = {
-   ...bookingData,
-   status: "pending",
-   createdAt: new Date(),
- };
+    //   const result = await orderCollection.insertOne(order);
 
- const result = await bookingCollection.insertOne(booking);
+    //   res.status(201).json({
+    //     success: true,
+    //     order: {
+    //       _id: result.insertedId,
+    //       trackingId,
+    //       totalPrice: order.totalPrice,
+    //     },
 
- res.status(201).json({
-   success: true,
-   bookingId: result.insertedId,
-   message: "Booking created successfully",
- });
+    //     message: "order created successfully",
+    //   });
+    // });
 
-})
+    // get all orders
 
-// get all bookings
-app.get("/booking", async (req, res) => {
-  const bookings = await bookingCollection
-    .find({})
-    .sort({ createdAt: -1 })
-    .toArray();
+    app.get("/orders", async (req, res) => {
+      const orders = await orderCollection
+        .find({})
+        .sort({ createdAt: -1 })
+        .toArray();
 
-  res.json({
-    success: true,
-    data: bookings,
-  });
-});
+      res.json({
+        success: true,
+        data: orders,
+      });
+    });
 
     //get product stats
     app.get("/products/stats", verifyFBToken, async (req, res) => {
-    
+      const [totalProducts, showOnHomeCount] = await Promise.all([
+        productCollection.countDocuments({}),
+        productCollection.countDocuments({ showOnHome: true }),
+      ]);
 
-       
-        const [totalProducts, showOnHomeCount] = await Promise.all([
-         
-          productCollection.countDocuments({}),
-          productCollection.countDocuments({ showOnHome: true }),
-        ]);
-
-        const productsByCategory = await productCollection
-          .aggregate([
-            {
-              $group: {
-                _id: { $ifNull: ["$category", "Uncategorized"] },
-                count: { $sum: 1 },
-              },
+      const productsByCategory = await productCollection
+        .aggregate([
+          {
+            $group: {
+              _id: { $ifNull: ["$category", "Uncategorized"] },
+              count: { $sum: 1 },
             },
-          ])
-          .toArray();
+          },
+        ])
+        .toArray();
 
-        const categoriesObj = {};
-        productsByCategory.forEach((cat) => {
-          const categoryName = cat._id ;
-          categoriesObj[categoryName] = cat.count;
-        });
+      const categoriesObj = {};
+      productsByCategory.forEach((cat) => {
+        const categoryName = cat._id;
+        categoriesObj[categoryName] = cat.count;
+      });
 
-        const responseData = {
-          totalProducts: totalProducts,
-          categories: categoriesObj,
-          showOnHome: showOnHomeCount,
-          hiddenFromHome: totalProducts - showOnHomeCount,
-        };
+      const responseData = {
+        totalProducts: totalProducts,
+        categories: categoriesObj,
+        showOnHome: showOnHomeCount,
+        hiddenFromHome: totalProducts - showOnHomeCount,
+      };
 
-        res.status(200).json({
-          success: true,
-          data: responseData,
-          message: "Product statistics fetched successfully",
-        });
+      res.status(200).json({
+        success: true,
+        data: responseData,
+        message: "Product statistics fetched successfully",
+      });
     });
 
     // show on home
@@ -588,29 +727,28 @@ app.get("/booking", async (req, res) => {
       verifyFBToken,
       verifyAdmin,
       async (req, res) => {
-        
-          const { id } = req.params;
-          const { showOnHome } = req.body;
+        const { id } = req.params;
+        const { showOnHome } = req.body;
 
-          const result = await productCollection.updateOne(
-            { _id: new ObjectId(id) },
-            { $set: { showOnHome: showOnHome, updatedAt: new Date() } }
-          );
+        const result = await productCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: { showOnHome: showOnHome, updatedAt: new Date() } }
+        );
 
-          if (result.matchedCount === 0) {
-            return res.status(404).json({
-              success: false,
-              message: "Product not found",
-            });
-          }
+        if (result.matchedCount === 0) {
+          return res.status(404).json({
+            success: false,
+            message: "Product not found",
+          });
+        }
 
-          res.status(200).json({
-            success: true,
-            message: showOnHome
-              ? "Product is now shown on home page"
-              : "Product removed from home page",
-            data: { showOnHome },
-          })
+        res.status(200).json({
+          success: true,
+          message: showOnHome
+            ? "Product is now shown on home page"
+            : "Product removed from home page",
+          data: { showOnHome },
+        });
       }
     );
 
@@ -620,37 +758,35 @@ app.get("/booking", async (req, res) => {
       verifyFBToken,
       verifyAdmin,
       async (req, res) => {
-        
-          const { id } = req.params;
-          const updateData = req.body;
-          const filteredUpdateData = {
-            name: updateData.name,
-            description: updateData.description || "",
-            price: parseFloat(updateData.price),
-            category: updateData.category,
-            images: updateData.images || [],
-            demoVideo: updateData.demoVideo || "",
-            paymentOptions: updateData.paymentOptions || [],
-            updatedAt: new Date(),
-          };
+        const { id } = req.params;
+        const updateData = req.body;
+        const filteredUpdateData = {
+          name: updateData.name,
+          description: updateData.description || "",
+          price: parseFloat(updateData.price),
+          category: updateData.category,
+          images: updateData.images || [],
+          demoVideo: updateData.demoVideo || "",
+          paymentOptions: updateData.paymentOptions || [],
+          updatedAt: new Date(),
+        };
 
+        const result = await productCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: filteredUpdateData }
+        );
 
-          const result = await productCollection.updateOne(
-            { _id: new ObjectId(id) },
-            { $set: filteredUpdateData }
-          );
+        const updatedProduct = await productCollection.findOne({
+          _id: new ObjectId(id),
+        });
 
-          const updatedProduct = await productCollection.findOne({
-            _id: new ObjectId(id),
-          });
-
-          res.status(200).json({
-            success: true,
-            message: "Product updated successfully",
-            data: updatedProduct,
-          });
-        
-  });
+        res.status(200).json({
+          success: true,
+          message: "Product updated successfully",
+          data: updatedProduct,
+        });
+      }
+    );
 
     // Delete product
     app.delete(
@@ -658,336 +794,135 @@ app.get("/booking", async (req, res) => {
       verifyFBToken,
       verifyAdmin,
       async (req, res) => {
-       
-          const { id } = req.params;
+        const { id } = req.params;
 
-          const product = await productCollection.findOne({
-            _id: new ObjectId(id),
-          });
+        const product = await productCollection.findOne({
+          _id: new ObjectId(id),
+        });
 
-          const result = await productCollection.deleteOne({
-            _id: new ObjectId(id),
-          });
+        const result = await productCollection.deleteOne({
+          _id: new ObjectId(id),
+        });
 
-          res.status(200).json({
-            success: true,
-            message: "Product deleted successfully",
-          });
+        res.status(200).json({
+          success: true,
+          message: "Product deleted successfully",
+        });
       }
     );
 
-    app.get("/orders", verifyFBToken, async (req, res) => {
-        const {
-          searchText = "",
-          page = 1,
-          limit = 10,
-          status = "all",
-        } = req.query;
+    // app.get("/orders", verifyFBToken, async (req, res) => {
+    //   const {
+    //     searchText = "",
+    //     page = 1,
+    //     limit = 10,
+    //     status = "all",
+    //   } = req.query;
 
-      
-        let filterQuery = {};
-        if (searchText && searchText.trim() !== "") {
-          filterQuery.$or = [
-            { orderId: { $regex: searchText, $options: "i" } },
-            { "user.name": { $regex: searchText, $options: "i" } },
-            { "user.email": { $regex: searchText, $options: "i" } },
-            { "product.name": { $regex: searchText, $options: "i" } },
-          ];
-        }
+    //   let filterQuery = {};
+    //   if (searchText && searchText.trim() !== "") {
+    //     filterQuery.$or = [
+    //       { orderId: { $regex: searchText, $options: "i" } },
+    //       { "user.name": { $regex: searchText, $options: "i" } },
+    //       { "user.email": { $regex: searchText, $options: "i" } },
+    //       { "product.name": { $regex: searchText, $options: "i" } },
+    //     ];
+    //   }
 
-       
-        if (status && status !== "all") {
-          filterQuery.status = status;
-        }
+    //   if (status && status !== "all") {
+    //     filterQuery.status = status;
+    //   }
 
-        const skip = (parseInt(page) - 1) * parseInt(limit);
-        const total = await orderCollection.countDocuments(filterQuery);
-        const orders = await orderCollection
-          .find(filterQuery)
-          .sort({ createdAt: -1 })
-          .skip(skip)
-          .limit(parseInt(limit))
-          .toArray();
+    //   const skip = (parseInt(page) - 1) * parseInt(limit);
+    //   const total = await orderCollection.countDocuments(filterQuery);
+    //   const orders = await orderCollection
+    //     .find(filterQuery)
+    //     .sort({ createdAt: -1 })
+    //     .skip(skip)
+    //     .limit(parseInt(limit))
+    //     .toArray();
 
-        res.status(200).json({
-          success: true,
-          data: orders,
-          total: total,
-          page: parseInt(page),
-          totalPages: Math.ceil(total / parseInt(limit)),
-          limit: parseInt(limit),
-        })
-    });
+    //   res.status(200).json({
+    //     success: true,
+    //     data: orders,
+    //     total: total,
+    //     page: parseInt(page),
+    //     totalPages: Math.ceil(total / parseInt(limit)),
+    //     limit: parseInt(limit),
+    //   });
+    // });
 
     // Get order statistics
-    app.get("/orders/stats", verifyFBToken, async (req, res) => {
-        const stats = await orderCollection
-          .aggregate([
-            {
-              $facet: {
-                totalCount: [{ $count: "totalOrders" }],
-                byStatus: [
-                  {
-                    $group: {
-                      _id: "$status",
-                      count: { $sum: 1 },
-                    },
-                  },
-                ],
-              },
-            },
-          ])
-          .toArray();
+    // app.get("/orders/stats", verifyFBToken, async (req, res) => {
+    //   const stats = await orderCollection
+    //     .aggregate([
+    //       {
+    //         $facet: {
+    //           totalCount: [{ $count: "totalOrders" }],
+    //           byStatus: [
+    //             {
+    //               $group: {
+    //                 _id: "$status",
+    //                 count: { $sum: 1 },
+    //               },
+    //             },
+    //           ],
+    //         },
+    //       },
+    //     ])
+    //     .toArray();
 
-        const result = stats[0] || {};
+    //   const result = stats[0] || {};
 
-        // Initialize counts
-        const statusCounts = {
-          totalOrders: result.totalCount?.[0]?.totalOrders || 0,
-          pending: 0,
-          approved: 0,
-          rejected: 0,
-          delivered: 0,
-          cancelled: 0,
-        };
+    //   // Initialize counts
+    //   const statusCounts = {
+    //     totalOrders: result.totalCount?.[0]?.totalOrders || 0,
+    //     pending: 0,
+    //     approved: 0,
+    //     rejected: 0,
+    //     delivered: 0,
+    //     cancelled: 0,
+    //   };
 
-        // Map status counts
-        if (result.byStatus && Array.isArray(result.byStatus)) {
-          result.byStatus.forEach((stat) => {
-            const status = stat._id?.toLowerCase();
-            if (statusCounts.hasOwnProperty(status)) {
-              statusCounts[status] = stat.count;
-            }
-          });
-        }
+    //   // Map status counts
+    //   if (result.byStatus && Array.isArray(result.byStatus)) {
+    //     result.byStatus.forEach((stat) => {
+    //       const status = stat._id?.toLowerCase();
+    //       if (statusCounts.hasOwnProperty(status)) {
+    //         statusCounts[status] = stat.count;
+    //       }
+    //     });
+    //   }
 
-        res.status(200).json({
-          success: true,
-          data: statusCounts,
-          message: "Order statistics fetched successfully",
-        })
-    });
+    //   res.status(200).json({
+    //     success: true,
+    //     data: statusCounts,
+    //     message: "Order statistics fetched successfully",
+    //   });
+    // });
 
     // Update order status
+
     app.patch(
       "/admin/orders/status/:id",
       verifyFBToken,
       verifyAdmin,
       async (req, res) => {
-          const { id } = req.params;
-          const { status } = req.body;
-          const validStatuses = [
-            "pending",
-            "approved",
-            "rejected",
-            "delivered",
-            "cancelled",
-          ];
-
-          const result = await orderCollection.updateOne(
-            { _id: new ObjectId(id) },
-            {
-              $set: {
-                status: status,
-                updatedAt: new Date(),
-              },
-            }
-          );
-
-          if (result.matchedCount === 0) {
-            return res.status(404).json({
-              success: false,
-              message: "Order not found",
-            });
-          }
-
-          res.status(200).json({
-            success: true,
-            message: `Order status updated to ${status}`,
-            data: { status },
-          });
-      }
-    );
-
-      app.post("/orders", async (req, res) => {
-     
-          const order = req.body;
-          const orderId = `ORD-${Date.now()
-            .toString()
-            .substring(5)}-${Math.random()
-            .toString(36)
-            .substring(2, 8)
-            .toUpperCase()}`;
-
-          const trackingNumber = `TRK-${Date.now()
-            .toString()
-            .substring(5)}-${Math.random()
-            .toString(36)
-            .substring(2, 6)
-            .toUpperCase()}`;
-
-          const orderData = {
-            ...order,
-            orderId: orderId,
-            trackingNumber: trackingNumber,
-            status: "pending",
-            paymentStatus: order.paymentStatus || "pending",
-            carrier: "Express Logistics",
-            currentLocation: {
-              city: "Dhaka",
-              country: "Bangladesh",
-              latitude: 23.8103,
-              longitude: 90.4125,
-            },
-            estimatedDelivery: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000), // 7 days from now
-            trackingHistory: [],
-            createdAt: new Date(),
-            updatedAt: new Date(),
-          };
-
-          const result = await orderCollection.insertOne(orderData);
-          await trackingCollection.insertOne({
-            orderId: result.insertedId,
-            trackingId: trackingNumber,
-            status: "order_created",
-            details: "Order placed successfully",
-            location: { city: "Dhaka", country: "Bangladesh" },
-            createdAt: new Date(),
-          });
-
-          res.status(201).json({
-            success: true,
-            message: "Order created successfully",
-            data: {
-              ...orderData,
-              _id: result.insertedId,
-            },
-          });
-      });
-
-    // Get Buyer orders with pagination and filters
-    app.get("/my-orders", verifyFBToken, async (req, res) => {
-      
-        const email = req.decoded_email;
-        const {
-          searchText = "",
-          page = 1,
-          limit = 10,
-          status = "all",
-        } = req.query;
-        let filterQuery = { "user.email": email };
-        if (searchText && searchText.trim() !== "") {
-          filterQuery.$or = [
-            { orderId: { $regex: searchText, $options: "i" } },
-            { "product.name": { $regex: searchText, $options: "i" } },
-          ];
-        }
-
-        if (status && status !== "all") {
-          filterQuery.status = status;
-        }
-
-        const skip = (parseInt(page) - 1) * parseInt(limit);
-        const total = await orderCollection.countDocuments(filterQuery);
-        const orders = await orderCollection
-          .find(filterQuery)
-          .sort({ createdAt: -1 })
-          .skip(skip)
-          .limit(parseInt(limit))
-          .toArray();
-
-        res.status(200).json({
-          success: true,
-          data: orders,
-          total: total,
-          page: parseInt(page),
-          totalPages: Math.ceil(total / parseInt(limit)),
-          limit: parseInt(limit),
-        });
-
-    });
-
-    // Get Buyer order statistics
-    app.get("/my-orders/stats", verifyFBToken, async (req, res) => {
-     
-        const email = req.decoded_email;
-        const stats = await orderCollection
-          .aggregate([
-            {
-              $match: { "user.email": email },
-            },
-            {
-              $facet: {
-                totalCount: [{ $count: "totalOrders" }],
-                byStatus: [
-                  {
-                    $group: {
-                      _id: "$status",
-                      count: { $sum: 1 },
-                    },
-                  },
-                ],
-              },
-            },
-          ])
-          .toArray();
-
-        const result = stats[0] || {};
-        const statusCounts = {
-          totalOrders: result.totalCount?.[0]?.totalOrders || 0,
-          pending: 0,
-          approved: 0,
-          rejected: 0,
-          delivered: 0,
-          cancelled: 0,
-        };
-
-        if (result.byStatus && Array.isArray(result.byStatus)) {
-          result.byStatus.forEach((stat) => {
-            const status = stat._id?.toLowerCase();
-            if (statusCounts.hasOwnProperty(status)) {
-              statusCounts[status] = stat.count;
-            }
-          });
-        }
-
-        res.status(200).json({
-          success: true,
-          data: statusCounts,
-          message: "Order statistics fetched successfully",
-        });
-    });
-
-    // Cancel Buyer order
-    app.patch("/my-orders/cancel/:id", verifyFBToken, async (req, res) => {
-    
         const { id } = req.params;
-        const email = req.decoded_email;
-        const order = await orderCollection.findOne({
-          _id: new ObjectId(id),
-          "user.email": email,
-        });
-
-        if (!order) {
-          return res.status(404).json({
-            success: false,
-            message: "Order not found or unauthorized",
-          });
-        }
-
-        if (order.status !== "pending") {
-          return res.status(400).json({
-            success: false,
-            message: "Only pending orders can be cancelled",
-          });
-        }
+        const { status } = req.body;
+        const validStatuses = [
+          "pending",
+          "approved",
+          "rejected",
+          "delivered",
+          "cancelled",
+        ];
 
         const result = await orderCollection.updateOne(
           { _id: new ObjectId(id) },
           {
             $set: {
-              status: "cancelled",
-              cancelledAt: new Date(),
+              status: status,
               updatedAt: new Date(),
             },
           }
@@ -999,12 +934,150 @@ app.get("/booking", async (req, res) => {
             message: "Order not found",
           });
         }
+
         res.status(200).json({
           success: true,
-          message: "Order cancelled successfully",
-          data: { status: "cancelled" },
+          message: `Order status updated to ${status}`,
+          data: { status },
         });
-  
+      }
+    );
+
+    // Get Buyer orders with pagination and filters
+    app.get("/my-orders", verifyFBToken, async (req, res) => {
+      const email = req.decoded_email;
+      const {
+        searchText = "",
+        page = 1,
+        limit = 10,
+        status = "all",
+      } = req.query;
+      let filterQuery = { "user.email": email };
+      if (searchText && searchText.trim() !== "") {
+        filterQuery.$or = [
+          { orderId: { $regex: searchText, $options: "i" } },
+          { "product.name": { $regex: searchText, $options: "i" } },
+        ];
+      }
+
+      if (status && status !== "all") {
+        filterQuery.status = status;
+      }
+
+      const skip = (parseInt(page) - 1) * parseInt(limit);
+      const total = await orderCollection.countDocuments(filterQuery);
+      const orders = await orderCollection
+        .find(filterQuery)
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(parseInt(limit))
+        .toArray();
+
+      res.status(200).json({
+        success: true,
+        data: orders,
+        total: total,
+        page: parseInt(page),
+        totalPages: Math.ceil(total / parseInt(limit)),
+        limit: parseInt(limit),
+      });
+    });
+
+    // Get Buyer order statistics
+    app.get("/my-orders/stats", verifyFBToken, async (req, res) => {
+      const email = req.decoded_email;
+      const stats = await orderCollection
+        .aggregate([
+          {
+            $match: { "user.email": email },
+          },
+          {
+            $facet: {
+              totalCount: [{ $count: "totalOrders" }],
+              byStatus: [
+                {
+                  $group: {
+                    _id: "$status",
+                    count: { $sum: 1 },
+                  },
+                },
+              ],
+            },
+          },
+        ])
+        .toArray();
+
+      const result = stats[0] || {};
+      const statusCounts = {
+        totalOrders: result.totalCount?.[0]?.totalOrders || 0,
+        pending: 0,
+        approved: 0,
+        rejected: 0,
+        delivered: 0,
+        cancelled: 0,
+      };
+
+      if (result.byStatus && Array.isArray(result.byStatus)) {
+        result.byStatus.forEach((stat) => {
+          const status = stat._id?.toLowerCase();
+          if (statusCounts.hasOwnProperty(status)) {
+            statusCounts[status] = stat.count;
+          }
+        });
+      }
+
+      res.status(200).json({
+        success: true,
+        data: statusCounts,
+        message: "Order statistics fetched successfully",
+      });
+    });
+
+    // Cancel Buyer order
+    app.patch("/my-orders/cancel/:id", verifyFBToken, async (req, res) => {
+      const { id } = req.params;
+      const email = req.decoded_email;
+      const order = await orderCollection.findOne({
+        _id: new ObjectId(id),
+        "user.email": email,
+      });
+
+      if (!order) {
+        return res.status(404).json({
+          success: false,
+          message: "Order not found or unauthorized",
+        });
+      }
+
+      if (order.status !== "pending") {
+        return res.status(400).json({
+          success: false,
+          message: "Only pending orders can be cancelled",
+        });
+      }
+
+      const result = await orderCollection.updateOne(
+        { _id: new ObjectId(id) },
+        {
+          $set: {
+            status: "cancelled",
+            cancelledAt: new Date(),
+            updatedAt: new Date(),
+          },
+        }
+      );
+
+      if (result.matchedCount === 0) {
+        return res.status(404).json({
+          success: false,
+          message: "Order not found",
+        });
+      }
+      res.status(200).json({
+        success: true,
+        message: "Order cancelled successfully",
+        data: { status: "cancelled" },
+      });
     });
     // Add a GET endpoint for fetching role (better for AuthProvider)
     app.get("/users/role/:email", async (req, res) => {
@@ -1115,108 +1188,6 @@ app.get("/booking", async (req, res) => {
       res.send(result);
     });
 
-    // payment related apis
-    app.post("/payment-checkout-session", async (req, res) => {
-      const productInfo = req.body;
-      const amount = parseInt(productInfo.cost) * 100;
-      const session = await stripe.checkout.sessions.create({
-        line_items: [
-          {
-            price_data: {
-              currency: "usd",
-              unit_amount: amount,
-              product_data: {
-                name: `Please pay for: ${productInfo.productName}`,
-              },
-            },
-            quantity: 1,
-          },
-        ],
-        mode: "payment",
-        metadata: {
-          productId: productInfo.productId,
-          trackingId: productInfo.trackingId,
-        },
-        customer_email: productInfo.senderEmail,
-        success_url: `${process.env.SITE_DOMAIN}/dashboard/payment-success?session_id={CHECKOUT_SESSION_ID}`,
-        cancel_url: `${process.env.SITE_DOMAIN}/dashboard/payment-cancelled`,
-      });
-
-      res.send({ url: session.url });
-    });
-
-    app.patch("/payment-success", async (req, res) => {
-      const sessionId = req.query.session_id;
-      const session = await stripe.checkout.sessions.retrieve(sessionId);
-      const transactionId = session.payment_intent;
-      const query = { transactionId: transactionId };
-      const paymentExist = await paymentCollection.findOne(query);
-      if (paymentExist) {
-        return res.send({
-          message: "already exists",
-          transactionId,
-          trackingId: paymentExist.trackingId,
-        });
-      }
-      const trackingId = session.metadata.trackingId;
-      if (session.payment_status === "paid") {
-        const id = session.metadata.productId;
-        const query = { _id: new ObjectId(id) };
-        const update = {
-          $set: {
-            paymentStatus: "paid",
-            deliveryStatus: "pending-pickup",
-          },
-        };
-
-        const result = await productCollection.updateOne(query, update)
-        const payment = {
-          amount: session.amount_total / 100,
-          currency: session.currency,
-          customerEmail: session.customer_email,
-          productId: session.metadata.productId,
-          productName: session.metadata.productName,
-          transactionId: session.payment_intent,
-          paymentStatus: session.payment_status,
-          paidAt: new Date(),
-          trackingId: trackingId,
-        };
-
-        const resultPayment = await paymentCollection.insertOne(payment);
-
-        logTracking(trackingId, "product_paid");
-
-        return res.send({
-          success: true,
-          modifyproduct: result,
-          trackingId: trackingId,
-          transactionId: session.payment_intent,
-          paymentInfo: resultPayment,
-        });
-      }
-      return res.send({ success: false });
-    });
-
-    // payment
-    app.get("/payments", verifyFBToken, async (req, res) => {
-      const email = req.query.email;
-      const query = {};
-
-      // console.log( 'headers', req.headers);
-
-      if (email) {
-        query.customerEmail = email;
-
-        // check email address
-        if (email !== req.decoded_email) {
-          return res.status(403).send({ message: "forbidden access" });
-        }
-      }
-      const cursor = paymentCollection.find(query).sort({ paidAt: -1 });
-      const result = await cursor.toArray();
-      res.send(result);
-    });
-
     app.get("/orders/delivery-per-day", async (req, res) => {
       const email = req.query.email;
       const pipeline = [
@@ -1268,67 +1239,63 @@ app.get("/booking", async (req, res) => {
     // Order Tracking Routes
     // Get order tracking details with full tracking history
     app.get("/track-order/:orderId", verifyFBToken, async (req, res) => {
-     
-        const { orderId } = req.params;
-        const email = req.decoded_email;
-        const order = await orderCollection.findOne({
-          $or: [{ _id: new ObjectId(orderId) }, { orderId: orderId }],
-          "user.email": email,
-        });
+      const { orderId } = req.params;
+      const email = req.decoded_email;
+      const order = await orderCollection.findOne({
+        $or: [{ _id: new ObjectId(orderId) }, { orderId: orderId }],
+        "user.email": email,
+      });
 
-     
-        const trackingHistory = generateTrackingHistory(order);
+      const trackingHistory = generateTrackingHistory(order);
 
-      
-        let estimatedDelivery = order.estimatedDelivery;
-        if (!estimatedDelivery) {
-          estimatedDelivery = new Date(order.createdAt);
-          estimatedDelivery.setDate(estimatedDelivery.getDate() + 7); // Default 7 days
-        }
-        let currentLocation = order.currentLocation;
-        if (
-          !currentLocation &&
-          order.trackingHistory &&
-          order.trackingHistory.length > 0
-        ) {
-          const lastUpdate =
-            order.trackingHistory[order.trackingHistory.length - 1];
-          currentLocation = lastUpdate.location;
-        }
-        let trackingNumber = order.trackingNumber;
-        if (!trackingNumber) {
-          trackingNumber = `TRK-${order._id
-            .toString()
-            .substring(0, 8)
-            .toUpperCase()}-${Date.now().toString().substring(8, 12)}`;
-        }
-        const carrier = order.carrier || "Express Logistics";
+      let estimatedDelivery = order.estimatedDelivery;
+      if (!estimatedDelivery) {
+        estimatedDelivery = new Date(order.createdAt);
+        estimatedDelivery.setDate(estimatedDelivery.getDate() + 7); // Default 7 days
+      }
+      let currentLocation = order.currentLocation;
+      if (
+        !currentLocation &&
+        order.trackingHistory &&
+        order.trackingHistory.length > 0
+      ) {
+        const lastUpdate =
+          order.trackingHistory[order.trackingHistory.length - 1];
+        currentLocation = lastUpdate.location;
+      }
+      let trackingNumber = order.trackingNumber;
+      if (!trackingNumber) {
+        trackingNumber = `TRK-${order._id
+          .toString()
+          .substring(0, 8)
+          .toUpperCase()}-${Date.now().toString().substring(8, 12)}`;
+      }
+      const carrier = order.carrier || "Express Logistics";
 
-        res.status(200).json({
-          success: true,
-          data: {
-            order: {
-              ...order,
-              estimatedDelivery,
-              currentLocation,
-              trackingNumber,
-              carrier,
-            },
-            trackingHistory,
-            statistics: {
-              totalSteps: trackingHistory.length,
-              completedSteps: trackingHistory.filter(
-                (t) => t.status === "completed"
-              ).length,
-              currentStep:
-                trackingHistory.find((t) => t.status === "current") || null,
-              pendingSteps: trackingHistory.filter(
-                (t) => t.status === "pending"
-              ).length,
-            },
+      res.status(200).json({
+        success: true,
+        data: {
+          order: {
+            ...order,
+            estimatedDelivery,
+            currentLocation,
+            trackingNumber,
+            carrier,
           },
-          message: "Order tracking details fetched successfully",
-        });
+          trackingHistory,
+          statistics: {
+            totalSteps: trackingHistory.length,
+            completedSteps: trackingHistory.filter(
+              (t) => t.status === "completed"
+            ).length,
+            currentStep:
+              trackingHistory.find((t) => t.status === "current") || null,
+            pendingSteps: trackingHistory.filter((t) => t.status === "pending")
+              .length,
+          },
+        },
+        message: "Order tracking details fetched successfully",
+      });
     });
 
     // Update order tracking (for admin)
@@ -1431,49 +1398,49 @@ app.get("/booking", async (req, res) => {
       "/track-order/:orderId/timeline",
       verifyFBToken,
       async (req, res) => {
-          const { orderId } = req.params;
-          const email = req.decoded_email;
+        const { orderId } = req.params;
+        const email = req.decoded_email;
 
-          const order = await orderCollection.findOne({
-            $or: [{ _id: new ObjectId(orderId) }, { orderId: orderId }],
-            "user.email": email,
+        const order = await orderCollection.findOne({
+          $or: [{ _id: new ObjectId(orderId) }, { orderId: orderId }],
+          "user.email": email,
+        });
+
+        if (!order) {
+          return res.status(404).json({
+            success: false,
+            message: "Order not found",
           });
+        }
+        const trackingLogs = await trackingCollection
+          .find({
+            orderId: order._id,
+          })
+          .sort({ createdAt: 1 })
+          .toArray();
 
-          if (!order) {
-            return res.status(404).json({
-              success: false,
-              message: "Order not found",
-            });
-          }
-          const trackingLogs = await trackingCollection
-            .find({
-              orderId: order._id,
-            })
-            .sort({ createdAt: 1 })
-            .toArray();
+        const timeline = trackingLogs.map((log) => ({
+          id: log._id,
+          step: log.details,
+          description: log.details,
+          location: log.location?.city
+            ? `${log.location.city}, ${log.location.country}`
+            : "Unknown",
+          status:
+            log.status === "product_delivered"
+              ? "completed"
+              : log.status === "driver_assigned"
+              ? "current"
+              : "pending",
+          date: log.createdAt,
+          icon: getIconForStatus(log.status),
+        }));
 
-          const timeline = trackingLogs.map((log) => ({
-            id: log._id,
-            step: log.details,
-            description: log.details,
-            location: log.location?.city
-              ? `${log.location.city}, ${log.location.country}`
-              : "Unknown",
-            status:
-              log.status === "product_delivered"
-                ? "completed"
-                : log.status === "driver_assigned"
-                ? "current"
-                : "pending",
-            date: log.createdAt,
-            icon: getIconForStatus(log.status),
-          }));
-
-          res.status(200).json({
-            success: true,
-            data: timeline,
-            message: "Timeline fetched successfully",
-          });
+        res.status(200).json({
+          success: true,
+          data: timeline,
+          message: "Timeline fetched successfully",
+        });
       }
     );
 
@@ -1587,60 +1554,61 @@ app.get("/booking", async (req, res) => {
     }
 
     // Optional Get real-time location updates (for testing/demo)
-    app.get( "/track-order/:orderId/location",
+    app.get(
+      "/track-order/:orderId/location",
       verifyFBToken,
       async (req, res) => {
-          const { orderId } = req.params;
-          const email = req.decoded_email;
+        const { orderId } = req.params;
+        const email = req.decoded_email;
 
-          const order = await orderCollection.findOne({
-            $or: [{ _id: new ObjectId(orderId) }, { orderId: orderId }],
-            "user.email": email,
-          });
+        const order = await orderCollection.findOne({
+          $or: [{ _id: new ObjectId(orderId) }, { orderId: orderId }],
+          "user.email": email,
+        });
 
-          const mockLocations = [
-            {
-              city: "Dhaka",
-              country: "Bangladesh",
-              latitude: 23.8103,
-              longitude: 90.4125,
-            },
-            {
-              city: "Chittagong",
-              country: "Bangladesh",
-              latitude: 22.3569,
-              longitude: 91.7832,
-            },
-            {
-              city: "Sylhet",
-              country: "Bangladesh",
-              latitude: 24.9045,
-              longitude: 91.8611,
-            },
-            {
-              city: "Khulna",
-              country: "Bangladesh",
-              latitude: 22.8456,
-              longitude: 89.5403,
-            },
-          ];
+        const mockLocations = [
+          {
+            city: "Dhaka",
+            country: "Bangladesh",
+            latitude: 23.8103,
+            longitude: 90.4125,
+          },
+          {
+            city: "Chittagong",
+            country: "Bangladesh",
+            latitude: 22.3569,
+            longitude: 91.7832,
+          },
+          {
+            city: "Sylhet",
+            country: "Bangladesh",
+            latitude: 24.9045,
+            longitude: 91.8611,
+          },
+          {
+            city: "Khulna",
+            country: "Bangladesh",
+            latitude: 22.8456,
+            longitude: 89.5403,
+          },
+        ];
 
-          // Get current location or generate random one
-          const currentLocation =
-            order.currentLocation ||
-            mockLocations[Math.floor(Math.random() * mockLocations.length)];
+        // Get current location or generate random one
+        const currentLocation =
+          order.currentLocation ||
+          mockLocations[Math.floor(Math.random() * mockLocations.length)];
 
-          res.status(200).json({
-            success: true,
-            data: {
-              location: currentLocation,
-              lastUpdated: new Date(),
-              accuracy: "High",
-              speed: Math.random() * 60 + 20, // Mock speed in km/h
-              heading: Math.random() * 360, // Mock heading in degrees
-            },
-            message: "Location fetched successfully",
-          });
+        res.status(200).json({
+          success: true,
+          data: {
+            location: currentLocation,
+            lastUpdated: new Date(),
+            accuracy: "High",
+            speed: Math.random() * 60 + 20, // Mock speed in km/h
+            heading: Math.random() * 360, // Mock heading in degrees
+          },
+          message: "Location fetched successfully",
+        });
       }
     );
 
@@ -1684,7 +1652,7 @@ app.get("/booking", async (req, res) => {
           totalOrders,
           pendingOrders,
           totalSpent,
-          recentBookings: totalOrders,
+          recentorders: totalOrders,
         },
       });
     });
