@@ -95,8 +95,8 @@ async function run() {
     };
 
     // payment related
-    app.post("/payment-checkout-session", async (req, res) => {
-      const { orderamount, product_name, orderId, senderEmail, trackingId } =
+    app.post("/payment-checkout-session", verifyFBToken, async (req, res) => {
+      const { orderamount, product_name, orderId, CustomerEmail, trackingId } =
         req.body;
 
       const session = await stripe.checkout.sessions.create({
@@ -118,9 +118,8 @@ async function run() {
         metadata: {
           orderId,
           trackingId,
-          productName: product_name,
         },
-        customer_email: senderEmail,
+        customer_email: CustomerEmail,
         success_url: `${process.env.CLIENT_URL}/payment-success?session_id={CHECKOUT_SESSION_ID}`,
         cancel_url: `${process.env.CLIENT_URL}/payment-canceled`,
       });
@@ -128,50 +127,51 @@ async function run() {
       res.json({
         success: true,
         url: session.url,
-        sessionId: session.id,
+        session_id: session.id,
       });
     });
 
-    app.get("/payment-success", async (req, res) => {
-      const sessionId = req.query.session_id;
-      const session = await stripe.checkout.sessions.retrieve(sessionId);
+   app.patch("/payment-success", async (req, res) => {
+     const { session_id } = req.query;
+     const session = await stripe.checkout.sessions.retrieve(session_id);
 
-      if (session.payment_status !== "paid") {
-        return res.status(400).json({
-          success: false,
-          message: "Payment not completed",
-        });
-      }
+     if (session.payment_status !== "paid") {
+       return res.status(400).json({
+         success: false,
+         message: "Payment not completed",
+       });
+     }
 
-      const transactionId = session.payment_intent;
-      const trackingId = session.metadata.trackingId;
+     const trackingId = session.metadata.trackingId;
+     await orderCollection.updateOne(
+       { trackingId },
+       {
+         $set: {
+           paymentStatus: "paid",
+           status: "confirmed",
+           transactionId: session.payment_intent,
+           paidAt: new Date(),
+           updatedAt: new Date(),
+         },
+       }
+     );
+   
 
-      const updateResult = await orderCollection.updateOne(
-        { trackingId },
-        {
-          $set: {
-            paymentStatus: "paid",
-            status: "confirmed",
-            transactionId,
-            paidAt: new Date(),
-            updatedAt: new Date(),
-          },
-        }
-      );
+     await paymentCollection.insertOne({
+       trackingId,
+       amount: session.amount_total / 100,
+       email: session.customer_email,
+       transactionId: session.payment_intent,
+     });
 
-      await paymentCollection.insertOne({
-        amount: session.amount_total / 100,
-        currency: session.currency,
-        customerEmail: session.customer_email,
-        transactionId,
-        paymentStatus: session.payment_status,
-        trackingId,
-        sessionId,
-        createdAt: new Date(),
-      });
+     res.json({
+       success: true,
+       transactionId: session.payment_intent,
+       trackingId,
+       amount: session.amount_total / 100,
+     });
+   });
 
-      res.redirect(`${process.env.CLIENT_URL}/dashboard/my-orders`);
-    });
 
     // Generate tracking ID
     const generateTrackingId = () => {
@@ -181,28 +181,41 @@ async function run() {
     };
 
     // POST /orders endpoint
-    app.post("/orders", async (req, res) => {
+    app.post("/orders", verifyFBToken, async (req, res) => {
       const orderData = req.body;
       const trackingId = generateTrackingId();
 
-      let status = "pending";
-      if (orderData.paymentMethod === "Stripe") {
-        status = "paid";
-      } else if (orderData.paymentMethod === "Cash on Delivery") {
-        status = "cod";
-      }
+   const isStripe = orderData.paymentMethod === "Stripe";
 
-      const order = {
-        ...orderData,
-        trackingId,
-        status: status,
-        paymentStatus:
-          orderData.paymentMethod === "Stripe" ? "paid" : "pending",
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      };
-
+   const order = {
+     ...orderData,
+     trackingId,
+     status: isStripe ? "pending" : "confirmed",
+     paymentStatus: isStripe ? "pending" : "cod",
+     createdAt: new Date(),
+     updatedAt: new Date(),
+   };
       const result = await orderCollection.insertOne(order);
+       if (!isStripe) {
+         await paymentCollection.insertOne({
+           amount: order.totalPrice,
+           currency: "usd",
+           email: order.CustomerEmail,
+           paymentStatus: "cod",
+           trackingId,
+           createdAt: new Date(),
+         });
+       }
+      const paymentLog = {
+        amount: order.totalPrice,
+        currency: "usd",
+        email: order.CustomerEmail,
+        paymentStatus: order.paymentStatus,
+        transactionId: null,
+        trackingId,
+        createdAt: new Date(),
+      };
+      await paymentCollection.insertOne(paymentLog);
 
       res.status(201).json({
         success: true,
@@ -212,6 +225,7 @@ async function run() {
           totalPrice: order.totalPrice,
           paymentMethod: order.paymentMethod,
           status: order.status,
+          paymentStatus: order.paymentStatus,
         },
         message: "Order created successfully",
       });
