@@ -82,6 +82,20 @@ async function run() {
 
       next();
     };
+const verifyAdminOrManager = async (req, res, next) => {
+  const email = req.decoded_email;
+
+  const user = await userCollection.findOne({ email });
+
+  if (user?.role === "admin" || user?.role === "manager") {
+    return next();
+  }
+
+  return res.status(403).json({
+    success: false,
+    message: "Forbidden access",
+  });
+};
 
     //Traking related
     const logTracking = async (trackingId, status) => {
@@ -315,9 +329,9 @@ async function run() {
     );
     //  Update product
     app.put(
-      "/admin/products/:id",
+      "/products/:id",
       verifyFBToken,
-      verifyAdmin,
+     verifyAdminOrManager,
       async (req, res) => {
         const { id } = req.params;
         const updateData = req.body;
@@ -349,33 +363,20 @@ async function run() {
       }
     );
     // Delete product
-    app.delete(
-      "/admin/products/:id",
-      verifyFBToken,
-      verifyAdmin,
-      async (req, res) => {
-        const { id } = req.params;
-
-        const product = await productCollection.findOne({
-          _id: new ObjectId(id),
-        });
-
-        const result = await productCollection.deleteOne({
-          _id: new ObjectId(id),
-        });
-
-        res.status(200).json({
-          success: true,
-          message: "Product deleted successfully",
-        });
-      }
-    );
+   app.delete(
+     "/products/:id",
+     verifyFBToken,
+     verifyAdminOrManager,
+     async (req, res) => {
+       await productCollection.deleteOne({ _id: new ObjectId(req.params.id) });
+       res.json({ success: true });
+     }
+   );
 
     //DashBoard manager all api
     app.get(
       "/manager/stats",
-      verifyFBToken,
-      verifyManager,
+      verifyFBToken,verifyManager,
       async (req, res) => {
         const allProducts = await productCollection.countDocuments({});
 
@@ -431,7 +432,7 @@ async function run() {
       });
     });
     // Get Buyer orders with pagination and filters
-app.get("/my-orders", verifyFBToken, async (req, res) => {
+    app.get("/my-orders", verifyFBToken, async (req, res) => {
   const email = req.decoded_email;
   const { searchText = "", page = 1, limit = 10, status = "all" } = req.query;
 
@@ -465,7 +466,7 @@ app.get("/my-orders", verifyFBToken, async (req, res) => {
     page: Number(page),
     totalPages: Math.ceil(total / limit),
   });
-});
+    });
     // Cancel Buyer order - Fixed endpoint path to match frontend expectation
     app.patch("/my-orders/cancel/:id", verifyFBToken, async (req, res) => {
       const { id } = req.params;
@@ -1117,7 +1118,7 @@ app.get("/my-orders", verifyFBToken, async (req, res) => {
     });
 
     // TODO: rename this to be specific like /products/:id/assign
-    app.patch("/products/:id", async (req, res) => {
+    app.patch("/products/assign/:id", async (req, res) => {
       const { orderId, orderName, orderEmail, trackingId } = req.body;
       const id = req.params.id;
       const query = { _id: new ObjectId(id) };
@@ -1180,14 +1181,6 @@ app.get("/my-orders", verifyFBToken, async (req, res) => {
       res.send(result);
     });
 
-    app.delete("/products/:id", async (req, res) => {
-      const id = req.params.id;
-      const query = { _id: new ObjectId(id) };
-
-      const result = await productCollection.deleteOne(query);
-      res.send(result);
-    });
-
     app.get("/orders/delivery-per-day", async (req, res) => {
       const email = req.query.email;
       const pipeline = [
@@ -1239,64 +1232,110 @@ app.get("/my-orders", verifyFBToken, async (req, res) => {
     // Order Tracking Routes
     // Get order tracking details with full tracking history
     app.get("/track-order/:orderId", verifyFBToken, async (req, res) => {
-      const { orderId } = req.params;
-      const email = req.decoded_email;
-      const order = await orderCollection.findOne({
-        $or: [{ _id: new ObjectId(orderId) }, { orderId: orderId }],
-        "user.email": email,
-      });
+      try {
+        const { orderId } = req.params;
+        const email = req.decoded_email;
 
-      const trackingHistory = generateTrackingHistory(order);
+        const order = await orderCollection.findOne({
+          $or: [{ _id: new ObjectId(orderId) }, { orderId: orderId }],
+          "user.email": email,
+        });
 
-      let estimatedDelivery = order.estimatedDelivery;
-      if (!estimatedDelivery) {
-        estimatedDelivery = new Date(order.createdAt);
-        estimatedDelivery.setDate(estimatedDelivery.getDate() + 7); // Default 7 days
-      }
-      let currentLocation = order.currentLocation;
-      if (
-        !currentLocation &&
-        order.trackingHistory &&
-        order.trackingHistory.length > 0
-      ) {
-        const lastUpdate =
-          order.trackingHistory[order.trackingHistory.length - 1];
-        currentLocation = lastUpdate.location;
-      }
-      let trackingNumber = order.trackingNumber;
-      if (!trackingNumber) {
-        trackingNumber = `TRK-${order._id
-          .toString()
-          .substring(0, 8)
-          .toUpperCase()}-${Date.now().toString().substring(8, 12)}`;
-      }
-      const carrier = order.carrier || "Express Logistics";
+        if (!order) {
+          return res.status(404).json({
+            success: false,
+            message: "Order not found",
+          });
+        }
 
-      res.status(200).json({
-        success: true,
-        data: {
-          order: {
-            ...order,
-            estimatedDelivery,
-            currentLocation,
-            trackingNumber,
-            carrier,
+        /* ---------------- ESTIMATED DELIVERY ---------------- */
+        const estimatedDelivery =
+          order.estimatedDelivery ||
+          new Date(
+            new Date(order.createdAt).getTime() + 7 * 24 * 60 * 60 * 1000
+          );
+
+        /* ---------------- TRACKING HISTORY ---------------- */
+        const trackingHistory = generateTrackingHistory(order).map(
+          (step, index, arr) => ({
+            step: step.step,
+            icon: step.icon || "box",
+            location: step.location || "Factory",
+            description: step.description || "",
+            date: step.date || order.createdAt,
+            status:
+              step.status ||
+              (index === arr.length - 1 ? "current" : "completed"),
+          })
+        );
+
+        /* ---------------- RESPONSE ---------------- */
+        res.status(200).json({
+          success: true,
+          data: {
+            order: {
+              orderId: order.orderId,
+              status: order.status,
+              paymentStatus: order.paymentStatus,
+              createdAt: order.createdAt,
+              estimatedDelivery,
+            },
+            trackingHistory,
           },
-          trackingHistory,
-          statistics: {
-            totalSteps: trackingHistory.length,
-            completedSteps: trackingHistory.filter(
-              (t) => t.status === "completed"
-            ).length,
-            currentStep:
-              trackingHistory.find((t) => t.status === "current") || null,
-            pendingSteps: trackingHistory.filter((t) => t.status === "pending")
-              .length,
-          },
-        },
-        message: "Order tracking details fetched successfully",
-      });
+          message: "Order tracking details fetched successfully",
+        });
+      } catch (error) {
+        console.error("Track order error:", error);
+        res.status(500).json({
+          success: false,
+          message: "Failed to fetch tracking details",
+        });
+      }
     });
+
+function generateTrackingHistory(order) {
+  return [
+    {
+      step: "Cutting Completed",
+      icon: "cutting",
+      location: "Production Unit",
+      status: "completed",
+      date: order.createdAt,
+    },
+    {
+      step: "Sewing Started",
+      icon: "sewing",
+      location: "Stitching Section",
+      status: "completed",
+      date: new Date(order.createdAt.getTime() + 1 * 86400000),
+    },
+    {
+      step: "Finishing",
+      icon: "finishing",
+      location: "Finishing Unit",
+      status: "current",
+      date: new Date(order.createdAt.getTime() + 2 * 86400000),
+    },
+    {
+      step: "QC Checked",
+      icon: "qc",
+      location: "Quality Control",
+      status: "pending",
+    },
+    {
+      step: "Packed",
+      icon: "packed",
+      location: "Warehouse",
+      status: "pending",
+    },
+    {
+      step: "Shipped",
+      icon: "shipped",
+      location: "Dispatch Center",
+      status: "pending",
+    },
+  ];
+}
 
     // Update order tracking (for admin)
     app.put(
@@ -1444,115 +1483,6 @@ app.get("/my-orders", verifyFBToken, async (req, res) => {
       }
     );
 
-    // Helper function to generate tracking history
-    function generateTrackingHistory(order) {
-      const steps = [
-        {
-          id: 1,
-          step: "Order Placed",
-          description: "Your order has been confirmed and payment received",
-          status: "completed",
-          icon: "FaClipboardCheck",
-          location: "Order Processing Center",
-          date: order.createdAt,
-        },
-        {
-          id: 2,
-          step: "Processing",
-          description: "Preparing your item for shipment",
-          status:
-            order.status === "processing"
-              ? "current"
-              : ["approved", "shipped", "delivered"].includes(order.status)
-              ? "completed"
-              : "pending",
-          icon: "FaWarehouse",
-          location: "Factory Warehouse",
-          date: new Date(order.createdAt.getTime() + 3600000), // 1 hour later
-        },
-        {
-          id: 3,
-          step: "Quality Check",
-          description: "Ensuring product meets quality standards",
-          status:
-            order.status === "processing"
-              ? "current"
-              : ["approved", "shipped", "delivered"].includes(order.status)
-              ? "completed"
-              : "pending",
-          icon: "FaCheckCircle",
-          location: "Quality Control",
-          date: new Date(order.createdAt.getTime() + 7200000), // 2 hours later
-        },
-        {
-          id: 4,
-          step: "Dispatched",
-          description: "Package handed over to delivery partner",
-          status:
-            order.status === "shipped"
-              ? "current"
-              : order.status === "delivered"
-              ? "completed"
-              : "pending",
-          icon: "FaTruck",
-          location: "Dispatch Center",
-          date: order.estimatedDelivery
-            ? new Date(order.estimatedDelivery.getTime() - 86400000) // 1 day before delivery
-            : new Date(order.createdAt.getTime() + 86400000), // 1 day later
-        },
-        {
-          id: 5,
-          step: "Out for Delivery",
-          description: "Package is on its way to your address",
-          status: order.status === "delivered" ? "completed" : "pending",
-          icon: "FaShippingFast",
-          location: "In Transit",
-          date: order.estimatedDelivery
-            ? new Date(order.estimatedDelivery.getTime() - 3600000) // 1 hour before delivery
-            : new Date(order.createdAt.getTime() + 172800000), // 2 days later
-        },
-        {
-          id: 6,
-          step: "Delivered",
-          description: "Package has been delivered successfully",
-          status: order.status === "delivered" ? "completed" : "pending",
-          icon: "FaBox",
-          location: order.shippingAddress
-            ? `${order.shippingAddress.city}, ${order.shippingAddress.country}`
-            : "Delivery Location",
-          date:
-            order.estimatedDelivery ||
-            new Date(order.createdAt.getTime() + 259200000), // 3 days later
-        },
-      ];
-
-      return steps;
-    }
-    function getStepFromStatus(status) {
-      const stepMap = {
-        pending: "Order Placed",
-        processing: "Processing",
-        approved: "Processing",
-        shipped: "Dispatched",
-        delivered: "Delivered",
-        cancelled: "Cancelled",
-      };
-      return stepMap[status] || "Order Update";
-    }
-    function getIconForStatus(status) {
-      const iconMap = {
-        order_created: "FaClipboardCheck",
-        processing: "FaWarehouse",
-        quality_check: "FaCheckCircle",
-        driver_assigned: "FaTruck",
-        in_transit: "FaShippingFast",
-        product_delivered: "FaBox",
-        payment_received: "FaDollarSign",
-        cancelled: "FaTimesCircle",
-      };
-      return iconMap[status] || "FaInfoCircle";
-    }
-
     // Optional Get real-time location updates (for testing/demo)
     app.get(
       "/track-order/:orderId/location",
@@ -1611,13 +1541,6 @@ app.get("/my-orders", verifyFBToken, async (req, res) => {
         });
       }
     );
-
-    app.get("/notifications", verifyFBToken, async (req, res) => {
-      res.send({
-        success: true,
-        data: [],
-      });
-    });
 
     // Send a ping to confirm a successful connection
     await client.db("admin").command({ ping: 1 });
