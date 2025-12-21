@@ -59,7 +59,7 @@ async function run() {
     const paymentCollection = db.collection("payment");
     const trackingCollection = db.collection("tracking");
 
-    // admin activity after verifyFBToken middleware
+    // verifyFBToken middleware
     const verifyAdmin = async (req, res, next) => {
       const email = req.decoded_email;
       const query = { email };
@@ -83,6 +83,7 @@ async function run() {
       next();
     };
 
+    //Traking related
     const logTracking = async (trackingId, status) => {
       const log = {
         trackingId,
@@ -94,7 +95,7 @@ async function run() {
       return result;
     };
 
-    // payment related
+    // payment related api
     app.post("/payment-checkout-session", verifyFBToken, async (req, res) => {
       const { orderamount, product_name, orderId, CustomerEmail, trackingId } =
         req.body;
@@ -131,105 +132,109 @@ async function run() {
       });
     });
 
-   app.patch("/payment-success", async (req, res) => {
-     const { session_id } = req.query;
-     const session = await stripe.checkout.sessions.retrieve(session_id);
+    app.patch("/payment-success", async (req, res) => {
+      const { session_id } = req.query;
+      const session = await stripe.checkout.sessions.retrieve(session_id);
 
-     if (session.payment_status !== "paid") {
-       return res.status(400).json({
-         success: false,
-         message: "Payment not completed",
-       });
-     }
+      if (session.payment_status !== "paid") {
+        return res.status(400).json({
+          success: false,
+          message: "Payment not completed",
+        });
+      }
 
-     const trackingId = session.metadata.trackingId;
-     await orderCollection.updateOne(
-       { trackingId },
-       {
-         $set: {
-           paymentStatus: "paid",
-           status: "confirmed",
-           transactionId: session.payment_intent,
-           paidAt: new Date(),
-           updatedAt: new Date(),
-         },
-       }
-     );
-   
+      const trackingId = session.metadata.trackingId;
+      await orderCollection.updateOne(
+        { trackingId },
+        {
+          $set: {
+            paymentStatus: "paid",
+            status: "confirmed",
+            transactionId: session.payment_intent,
+            paidAt: new Date(),
+            updatedAt: new Date(),
+          },
+        }
+      );
 
-     await paymentCollection.insertOne({
-       trackingId,
-       amount: session.amount_total / 100,
-       email: session.customer_email,
-       transactionId: session.payment_intent,
-     });
+      await paymentCollection.insertOne({
+        trackingId,
+        amount: session.amount_total / 100,
+        email: session.customer_email,
+        transactionId: session.payment_intent,
+      });
 
-     res.json({
-       success: true,
-       transactionId: session.payment_intent,
-       trackingId,
-       amount: session.amount_total / 100,
-     });
-   });
+      res.json({
+        success: true,
+        transactionId: session.payment_intent,
+        trackingId,
+        amount: session.amount_total / 100,
+      });
+    });
 
+    //Profile
+    app.get("/auth/profile", verifyFBToken, async (req, res) => {
+      const email = req.decoded_email;
 
-    // Generate tracking ID
+      const user = await userCollection.findOne({ email });
+
+      if (!user) {
+        return res.status(404).send({ message: "User not found" });
+      }
+
+      res.send({
+        success: true,
+        data: user,
+      });
+    });
+
+    //tracking ID genarated
     const generateTrackingId = () => {
-      const timestamp = new Date().toISOString().slice(0, 10).replace(/-/g, ""); 
+      const timestamp = new Date().toISOString().slice(0, 10).replace(/-/g, "");
       const random = crypto.randomBytes(3).toString("hex").toUpperCase();
       return `TRK${timestamp}${random}`;
     };
 
-    // POST /orders endpoint
-    app.post("/orders", verifyFBToken, async (req, res) => {
-      const orderData = req.body;
-      const trackingId = generateTrackingId();
+    // POST (orders  and  payment  api)
+   app.post("/orders", verifyFBToken, async (req, res) => {
+     const orderData = req.body;
+     const trackingId = generateTrackingId();
 
-   const isStripe = orderData.paymentMethod === "Stripe";
+     const isStripe = orderData.paymentMethod === "Stripe";
 
-   const order = {
-     ...orderData,
-     trackingId,
-     status: isStripe ? "pending" : "confirmed",
-     paymentStatus: isStripe ? "pending" : "cod",
-     createdAt: new Date(),
-     updatedAt: new Date(),
-   };
-      const result = await orderCollection.insertOne(order);
-       if (!isStripe) {
-         await paymentCollection.insertOne({
-           amount: order.totalPrice,
-           currency: "usd",
-           email: order.CustomerEmail,
-           paymentStatus: "cod",
-           trackingId,
-           createdAt: new Date(),
-         });
-       }
-      const paymentLog = {
-        amount: order.totalPrice,
-        currency: "usd",
-        email: order.CustomerEmail,
-        paymentStatus: order.paymentStatus,
-        transactionId: null,
-        trackingId,
-        createdAt: new Date(),
-      };
-      await paymentCollection.insertOne(paymentLog);
+     const order = {
+       ...orderData,
+       trackingId,
+       status: isStripe ? "confirmed" : "pending",
+       paymentStatus: isStripe ? "paid" : "cod",
+       createdAt: new Date(),
+       updatedAt: new Date(),
+     };
+     
+     const result = await orderCollection.insertOne(order);
+     await paymentCollection.insertOne({
+       amount: order.totalPrice,
+       currency: "usd",
+       email: order.CustomerEmail,
+       paymentStatus: order.paymentStatus,
+       transactionId: isStripe ? orderData.transactionId || null : null,
+       trackingId,
+       createdAt: new Date(),
+     });
 
-      res.status(201).json({
-        success: true,
-        order: {
-          _id: result.insertedId,
-          trackingId,
-          totalPrice: order.totalPrice,
-          paymentMethod: order.paymentMethod,
-          status: order.status,
-          paymentStatus: order.paymentStatus,
-        },
-        message: "Order created successfully",
-      });
-    });
+     res.status(201).json({
+       success: true,
+       order: {
+         _id: result.insertedId,
+         trackingId,
+         totalPrice: order.totalPrice,
+         paymentMethod: order.paymentMethod,
+         status: order.status,
+         paymentStatus: order.paymentStatus,
+       },
+       message: "Order created successfully",
+     });
+   });
 
     // get payments
     app.get("/payments", verifyFBToken, async (req, res) => {
@@ -250,6 +255,251 @@ async function run() {
       const result = await cursor.toArray();
       res.send(result);
     });
+
+    //DashBoard admin all api
+    app.get("/admin/stats", verifyFBToken, verifyAdmin, async (req, res) => {
+      const allProducts = await productCollection.countDocuments({});
+
+      const allOrders = await orderCollection.countDocuments({
+        payment_options: { $ne: "PayFirst" },
+      });
+      const allUsers = await userCollection.countDocuments({});
+
+      const totalRevenue = await paymentCollection
+        .aggregate([{ $group: { _id: null, total: { $sum: "$amount" } } }])
+        .toArray();
+
+      const pendingOrders = await orderCollection.countDocuments({
+        payment_status: "pending",
+      });
+      res.send({
+        success: true,
+        data: {
+          allProducts,
+          pendingOrders,
+          allUsers,
+          allOrders,
+          totalRevenue: totalRevenue[0]?.total || 0,
+        },
+      });
+    });
+    // show on home
+    app.patch(
+      "/admin/products/show-on-home/:id",
+      verifyFBToken,
+      verifyAdmin,
+      async (req, res) => {
+        const { id } = req.params;
+        const { showOnHome } = req.body;
+
+        const result = await productCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: { showOnHome: showOnHome, updatedAt: new Date() } }
+        );
+
+        if (result.matchedCount === 0) {
+          return res.status(404).json({
+            success: false,
+            message: "Product not found",
+          });
+        }
+
+        res.status(200).json({
+          success: true,
+          message: showOnHome
+            ? "Product is now shown on home page"
+            : "Product removed from home page",
+          data: { showOnHome },
+        });
+      }
+    );
+    //  Update product
+    app.put(
+      "/admin/products/:id",
+      verifyFBToken,
+      verifyAdmin,
+      async (req, res) => {
+        const { id } = req.params;
+        const updateData = req.body;
+        const filteredUpdateData = {
+          name: updateData.name,
+          description: updateData.description || "",
+          price: parseFloat(updateData.price),
+          category: updateData.category,
+          images: updateData.images || [],
+          demoVideo: updateData.demoVideo || "",
+          paymentOptions: updateData.paymentOptions || [],
+          updatedAt: new Date(),
+        };
+
+        const result = await productCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: filteredUpdateData }
+        );
+
+        const updatedProduct = await productCollection.findOne({
+          _id: new ObjectId(id),
+        });
+
+        res.status(200).json({
+          success: true,
+          message: "Product updated successfully",
+          data: updatedProduct,
+        });
+      }
+    );
+    // Delete product
+    app.delete(
+      "/admin/products/:id",
+      verifyFBToken,
+      verifyAdmin,
+      async (req, res) => {
+        const { id } = req.params;
+
+        const product = await productCollection.findOne({
+          _id: new ObjectId(id),
+        });
+
+        const result = await productCollection.deleteOne({
+          _id: new ObjectId(id),
+        });
+
+        res.status(200).json({
+          success: true,
+          message: "Product deleted successfully",
+        });
+      }
+    );
+
+    //DashBoard manager all api
+    app.get(
+      "/manager/stats",
+      verifyFBToken,
+      verifyManager,
+      async (req, res) => {
+        const allProducts = await productCollection.countDocuments({});
+
+        const allOrders = await orderCollection.countDocuments({
+          payment_options: { $ne: "PayFirst" },
+        });
+        const allUsers = await userCollection.countDocuments({});
+
+        const totalRevenue = await paymentCollection
+          .aggregate([{ $group: { _id: null, total: { $sum: "$amount" } } }])
+          .toArray();
+
+        const pendingOrders = await orderCollection.countDocuments({
+          payment_status: "pending",
+        });
+        res.send({
+          success: true,
+          data: {
+            allProducts,
+            pendingOrders,
+            allUsers,
+            allOrders,
+            totalRevenue: totalRevenue[0]?.total || 0,
+          },
+        });
+      }
+    );
+
+    //DashBoard  buyer all api
+    app.get("/buyer/stats", verifyFBToken, async (req, res) => {
+      const email = req.decoded_email;
+
+      const totalOrders = await orderCollection.countDocuments({
+        CustomerEmail: email,
+      });
+
+      const pendingOrders = await orderCollection.countDocuments({
+        CustomerEmail: email,
+        status: "pending",
+      });
+
+      const payments = await paymentCollection.find({ email: email }).toArray();
+
+      const totalSpent = payments.reduce((sum, p) => sum + (p.amount || 0), 0);
+
+      res.send({
+        success: true,
+        data: {
+          totalOrders,
+          pendingOrders,
+          totalSpent,
+        },
+      });
+    });
+    // Get Buyer orders with pagination and filters
+app.get("/my-orders", verifyFBToken, async (req, res) => {
+  const email = req.decoded_email;
+  const { searchText = "", page = 1, limit = 10, status = "all" } = req.query;
+
+  let filterQuery = { CustomerEmail: email };
+
+  if (searchText.trim()) {
+    filterQuery.$or = [
+      { orderId: { $regex: searchText, $options: "i" } },
+      { "product.name": { $regex: searchText, $options: "i" } },
+    ];
+  }
+
+  if (status !== "all") {
+    filterQuery.status = status;
+  }
+
+  const skip = (page - 1) * limit;
+
+  const total = await orderCollection.countDocuments(filterQuery);
+  const orders = await orderCollection
+    .find(filterQuery)
+    .sort({ createdAt: -1 })
+    .skip(skip)
+    .limit(Number(limit))
+    .toArray();
+
+  res.json({
+    success: true,
+    data: orders,
+    total,
+    page: Number(page),
+    totalPages: Math.ceil(total / limit),
+  });
+});
+    // Cancel Buyer order - Fixed endpoint path to match frontend expectation
+    app.patch("/my-orders/cancel/:id", verifyFBToken, async (req, res) => {
+      const { id } = req.params;
+      const email = req.decoded_email;
+
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).json({ success: false, message: "Invalid ID" });
+      }
+
+      const order = await orderCollection.findOne({
+        _id: new ObjectId(id),
+        CustomerEmail: email,
+      });
+
+      if (order.status !== "pending") {
+        return res.status(400).json({
+          success: false,
+          message: "Only pending orders can be cancelled",
+        });
+      }
+
+      await orderCollection.updateOne(
+        { _id: new ObjectId(id) },
+        {
+          $set: {
+            status: "cancelled",
+            updatedAt: new Date(),
+          },
+        }
+      );
+
+      res.json({ success: true });
+    });
+
 
     //user post in database
     app.post("/users", async (req, res) => {
@@ -387,7 +637,6 @@ async function run() {
       });
     });
 
-    //
     //Role update in frontend
     app.patch(
       "/admin/users/role/:id",
@@ -445,34 +694,6 @@ async function run() {
         });
       }
     );
-
-    // ADMIN STATS IN FRONTEND (FULL DATABASE)
-    app.get("/admin/stats", verifyFBToken, verifyAdmin, async (req, res) => {
-      const allProducts = await productCollection.countDocuments({});
-
-      const allOrders = await orderCollection.countDocuments({
-        payment_options: { $ne: "PayFirst" },
-      });
-      const allUsers = await userCollection.countDocuments({});
-
-      const totalRevenue = await paymentCollection
-        .aggregate([{ $group: { _id: null, total: { $sum: "$amount" } } }])
-        .toArray();
-
-      const pendingOrders = await orderCollection.countDocuments({
-        payment_status: "pending",
-      });
-      res.send({
-        success: true,
-        data: {
-          allProducts,
-          pendingOrders,
-          allUsers,
-          allOrders,
-          totalRevenue: totalRevenue[0]?.total || 0,
-        },
-      });
-    });
 
     // ADMIN ANALYTICS WITH FILTERS IN FRONTEND
     app.get(
@@ -726,96 +947,6 @@ async function run() {
       });
     });
 
-    // show on home
-    app.patch(
-      "/admin/products/show-on-home/:id",
-      verifyFBToken,
-      verifyAdmin,
-      async (req, res) => {
-        const { id } = req.params;
-        const { showOnHome } = req.body;
-
-        const result = await productCollection.updateOne(
-          { _id: new ObjectId(id) },
-          { $set: { showOnHome: showOnHome, updatedAt: new Date() } }
-        );
-
-        if (result.matchedCount === 0) {
-          return res.status(404).json({
-            success: false,
-            message: "Product not found",
-          });
-        }
-
-        res.status(200).json({
-          success: true,
-          message: showOnHome
-            ? "Product is now shown on home page"
-            : "Product removed from home page",
-          data: { showOnHome },
-        });
-      }
-    );
-
-    //  Update product
-    app.put(
-      "/admin/products/:id",
-      verifyFBToken,
-      verifyAdmin,
-      async (req, res) => {
-        const { id } = req.params;
-        const updateData = req.body;
-        const filteredUpdateData = {
-          name: updateData.name,
-          description: updateData.description || "",
-          price: parseFloat(updateData.price),
-          category: updateData.category,
-          images: updateData.images || [],
-          demoVideo: updateData.demoVideo || "",
-          paymentOptions: updateData.paymentOptions || [],
-          updatedAt: new Date(),
-        };
-
-        const result = await productCollection.updateOne(
-          { _id: new ObjectId(id) },
-          { $set: filteredUpdateData }
-        );
-
-        const updatedProduct = await productCollection.findOne({
-          _id: new ObjectId(id),
-        });
-
-        res.status(200).json({
-          success: true,
-          message: "Product updated successfully",
-          data: updatedProduct,
-        });
-      }
-    );
-
-    // Delete product
-    app.delete(
-      "/admin/products/:id",
-      verifyFBToken,
-      verifyAdmin,
-      async (req, res) => {
-        const { id } = req.params;
-
-        const product = await productCollection.findOne({
-          _id: new ObjectId(id),
-        });
-
-        const result = await productCollection.deleteOne({
-          _id: new ObjectId(id),
-        });
-
-        res.status(200).json({
-          success: true,
-          message: "Product deleted successfully",
-        });
-      }
-    );
-
     // app.get("/orders", verifyFBToken, async (req, res) => {
     //   const {
     //     searchText = "",
@@ -948,142 +1079,6 @@ async function run() {
       }
     );
 
-    // Get Buyer orders with pagination and filters
-    app.get("/my-orders", verifyFBToken, async (req, res) => {
-      const email = req.decoded_email;
-      const {
-        searchText = "",
-        page = 1,
-        limit = 10,
-        status = "all",
-      } = req.query;
-      let filterQuery = { "user.email": email };
-      if (searchText && searchText.trim() !== "") {
-        filterQuery.$or = [
-          { orderId: { $regex: searchText, $options: "i" } },
-          { "product.name": { $regex: searchText, $options: "i" } },
-        ];
-      }
-
-      if (status && status !== "all") {
-        filterQuery.status = status;
-      }
-
-      const skip = (parseInt(page) - 1) * parseInt(limit);
-      const total = await orderCollection.countDocuments(filterQuery);
-      const orders = await orderCollection
-        .find(filterQuery)
-        .sort({ createdAt: -1 })
-        .skip(skip)
-        .limit(parseInt(limit))
-        .toArray();
-
-      res.status(200).json({
-        success: true,
-        data: orders,
-        total: total,
-        page: parseInt(page),
-        totalPages: Math.ceil(total / parseInt(limit)),
-        limit: parseInt(limit),
-      });
-    });
-
-    // Get Buyer order statistics
-    app.get("/my-orders/stats", verifyFBToken, async (req, res) => {
-      const email = req.decoded_email;
-      const stats = await orderCollection
-        .aggregate([
-          {
-            $match: { "user.email": email },
-          },
-          {
-            $facet: {
-              totalCount: [{ $count: "totalOrders" }],
-              byStatus: [
-                {
-                  $group: {
-                    _id: "$status",
-                    count: { $sum: 1 },
-                  },
-                },
-              ],
-            },
-          },
-        ])
-        .toArray();
-
-      const result = stats[0] || {};
-      const statusCounts = {
-        totalOrders: result.totalCount?.[0]?.totalOrders || 0,
-        pending: 0,
-        approved: 0,
-        rejected: 0,
-        delivered: 0,
-        cancelled: 0,
-      };
-
-      if (result.byStatus && Array.isArray(result.byStatus)) {
-        result.byStatus.forEach((stat) => {
-          const status = stat._id?.toLowerCase();
-          if (statusCounts.hasOwnProperty(status)) {
-            statusCounts[status] = stat.count;
-          }
-        });
-      }
-
-      res.status(200).json({
-        success: true,
-        data: statusCounts,
-        message: "Order statistics fetched successfully",
-      });
-    });
-
-    // Cancel Buyer order
-    app.patch("/my-orders/cancel/:id", verifyFBToken, async (req, res) => {
-      const { id } = req.params;
-      const email = req.decoded_email;
-      const order = await orderCollection.findOne({
-        _id: new ObjectId(id),
-        "user.email": email,
-      });
-
-      if (!order) {
-        return res.status(404).json({
-          success: false,
-          message: "Order not found or unauthorized",
-        });
-      }
-
-      if (order.status !== "pending") {
-        return res.status(400).json({
-          success: false,
-          message: "Only pending orders can be cancelled",
-        });
-      }
-
-      const result = await orderCollection.updateOne(
-        { _id: new ObjectId(id) },
-        {
-          $set: {
-            status: "cancelled",
-            cancelledAt: new Date(),
-            updatedAt: new Date(),
-          },
-        }
-      );
-
-      if (result.matchedCount === 0) {
-        return res.status(404).json({
-          success: false,
-          message: "Order not found",
-        });
-      }
-      res.status(200).json({
-        success: true,
-        message: "Order cancelled successfully",
-        data: { status: "cancelled" },
-      });
-    });
     // Add a GET endpoint for fetching role (better for AuthProvider)
     app.get("/users/role/:email", async (req, res) => {
       const { email } = req.params;
@@ -1616,51 +1611,6 @@ async function run() {
         });
       }
     );
-
-    //Profile
-    app.get("/auth/profile", verifyFBToken, async (req, res) => {
-      const email = req.decoded_email;
-
-      const user = await userCollection.findOne({ email });
-
-      if (!user) {
-        return res.status(404).send({ message: "User not found" });
-      }
-
-      res.send({
-        success: true,
-        data: user,
-      });
-    });
-
-    app.get("/buyer/stats", verifyFBToken, async (req, res) => {
-      const email = req.decoded_email;
-
-      const totalOrders = await productCollection.countDocuments({
-        senderEmail: email,
-      });
-
-      const pendingOrders = await productCollection.countDocuments({
-        senderEmail: email,
-        deliveryStatus: { $ne: "product_delivered" },
-      });
-
-      const payments = await paymentCollection
-        .find({ customerEmail: email })
-        .toArray();
-
-      const totalSpent = payments.reduce((sum, p) => sum + (p.amount || 0), 0);
-
-      res.send({
-        success: true,
-        data: {
-          totalOrders,
-          pendingOrders,
-          totalSpent,
-          recentorders: totalOrders,
-        },
-      });
-    });
 
     app.get("/notifications", verifyFBToken, async (req, res) => {
       res.send({
