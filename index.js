@@ -82,20 +82,20 @@ async function run() {
 
       next();
     };
-const verifyAdminOrManager = async (req, res, next) => {
-  const email = req.decoded_email;
+    const verifyAdminOrManager = async (req, res, next) => {
+      const email = req.decoded_email;
 
-  const user = await userCollection.findOne({ email });
+      const user = await userCollection.findOne({ email });
 
-  if (user?.role === "admin" || user?.role === "manager") {
-    return next();
-  }
+      if (user?.role === "admin" || user?.role === "manager") {
+        return next();
+      }
 
-  return res.status(403).json({
-    success: false,
-    message: "Forbidden access",
-  });
-};
+      return res.status(403).json({
+        success: false,
+        message: "Forbidden access",
+      });
+    };
 
     //Traking related
     const logTracking = async (trackingId, status) => {
@@ -171,13 +171,6 @@ const verifyAdminOrManager = async (req, res, next) => {
         }
       );
 
-      await paymentCollection.insertOne({
-        trackingId,
-        amount: session.amount_total / 100,
-        email: session.customer_email,
-        transactionId: session.payment_intent,
-      });
-
       res.json({
         success: true,
         transactionId: session.payment_intent,
@@ -210,64 +203,44 @@ const verifyAdminOrManager = async (req, res, next) => {
     };
 
     // POST (orders  and  payment  api)
-   app.post("/orders", verifyFBToken, async (req, res) => {
-     const orderData = req.body;
-     const trackingId = generateTrackingId();
+    app.post("/orders", verifyFBToken, async (req, res) => {
+      const orderData = req.body;
+      const trackingId = generateTrackingId();
 
-     const isStripe = orderData.paymentMethod === "Stripe";
+      const isStripe = orderData.paymentMethod === "Stripe";
 
-     const order = {
-       ...orderData,
-       trackingId,
-       status: isStripe ? "confirmed" : "pending",
-       paymentStatus: isStripe ? "paid" : "cod",
-       createdAt: new Date(),
-       updatedAt: new Date(),
-     };
-     
-     const result = await orderCollection.insertOne(order);
-     await paymentCollection.insertOne({
-       amount: order.totalPrice,
-       currency: "usd",
-       email: order.CustomerEmail,
-       paymentStatus: order.paymentStatus,
-       transactionId: isStripe ? orderData.transactionId || null : null,
-       trackingId,
-       createdAt: new Date(),
-     });
+      const order = {
+        ...orderData,
+        trackingId,
+        status:"pending",
+        paymentStatus: isStripe ? "paid" : "cod",
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
 
-     res.status(201).json({
-       success: true,
-       order: {
-         _id: result.insertedId,
-         trackingId,
-         totalPrice: order.totalPrice,
-         paymentMethod: order.paymentMethod,
-         status: order.status,
-         paymentStatus: order.paymentStatus,
-       },
-       message: "Order created successfully",
-     });
-   });
+      const result = await orderCollection.insertOne(order);
+      await paymentCollection.insertOne({
+        amount: order.totalPrice,
+        currency: "usd",
+        email: order.CustomerEmail,
+        paymentStatus: order.paymentStatus,
+        transactionId: isStripe ? orderData.transactionId || null : null,
+        trackingId,
+        createdAt: new Date(),
+      });
 
-    // get payments
-    app.get("/payments", verifyFBToken, async (req, res) => {
-      const email = req.query.email;
-      const query = {};
-
-      // console.log( 'headers', req.headers);
-
-      if (email) {
-        query.customerEmail = email;
-
-        // check email address
-        if (email !== req.decoded_email) {
-          return res.status(403).send({ message: "forbidden access" });
-        }
-      }
-      const cursor = paymentCollection.find(query).sort({ paidAt: -1 });
-      const result = await cursor.toArray();
-      res.send(result);
+      res.status(201).json({
+        success: true,
+        order: {
+          _id: result.insertedId,
+          trackingId,
+          totalPrice: order.totalPrice,
+          paymentMethod: order.paymentMethod,
+          status: order.status,
+          paymentStatus: order.paymentStatus,
+        },
+        message: "Order created successfully",
+      });
     });
 
     //DashBoard admin all api
@@ -331,7 +304,7 @@ const verifyAdminOrManager = async (req, res, next) => {
     app.put(
       "/products/:id",
       verifyFBToken,
-     verifyAdminOrManager,
+      verifyAdminOrManager,
       async (req, res) => {
         const { id } = req.params;
         const updateData = req.body;
@@ -363,20 +336,21 @@ const verifyAdminOrManager = async (req, res, next) => {
       }
     );
     // Delete product
-   app.delete(
-     "/products/:id",
-     verifyFBToken,
-     verifyAdminOrManager,
-     async (req, res) => {
-       await productCollection.deleteOne({ _id: new ObjectId(req.params.id) });
-       res.json({ success: true });
-     }
-   );
+    app.delete(
+      "/products/:id",
+      verifyFBToken,
+      verifyAdminOrManager,
+      async (req, res) => {
+        await productCollection.deleteOne({ _id: new ObjectId(req.params.id) });
+        res.json({ success: true });
+      }
+    );
 
     //DashBoard manager all api
     app.get(
       "/manager/stats",
-      verifyFBToken,verifyManager,
+      verifyFBToken,
+      verifyManager,
       async (req, res) => {
         const allProducts = await productCollection.countDocuments({});
 
@@ -413,9 +387,9 @@ const verifyAdminOrManager = async (req, res, next) => {
         CustomerEmail: email,
       });
 
-      const pendingOrders = await orderCollection.countDocuments({
+      const pendingPayment = await orderCollection.countDocuments({
         CustomerEmail: email,
-        status: "pending",
+        PaymentStatus: "pending",
       });
 
       const payments = await paymentCollection.find({ email: email }).toArray();
@@ -426,46 +400,51 @@ const verifyAdminOrManager = async (req, res, next) => {
         success: true,
         data: {
           totalOrders,
-          pendingOrders,
+          pendingPayment,
           totalSpent,
         },
       });
     });
     // Get Buyer orders with pagination and filters
     app.get("/my-orders", verifyFBToken, async (req, res) => {
-  const email = req.decoded_email;
-  const { searchText = "", page = 1, limit = 10, status = "all" } = req.query;
+      const email = req.decoded_email;
+      const {
+        searchText = "",
+        page = 1,
+        limit = 10,
+        status = "all",
+      } = req.query;
 
-  let filterQuery = { CustomerEmail: email };
+      let filterQuery = { CustomerEmail: email };
 
-  if (searchText.trim()) {
-    filterQuery.$or = [
-      { orderId: { $regex: searchText, $options: "i" } },
-      { "product.name": { $regex: searchText, $options: "i" } },
-    ];
-  }
+      if (searchText.trim()) {
+        filterQuery.$or = [
+          { orderId: { $regex: searchText, $options: "i" } },
+          { "product.name": { $regex: searchText, $options: "i" } },
+        ];
+      }
 
-  if (status !== "all") {
-    filterQuery.status = status;
-  }
+      if (status !== "all") {
+        filterQuery.status = status;
+      }
 
-  const skip = (page - 1) * limit;
+      const skip = (page - 1) * limit;
 
-  const total = await orderCollection.countDocuments(filterQuery);
-  const orders = await orderCollection
-    .find(filterQuery)
-    .sort({ createdAt: -1 })
-    .skip(skip)
-    .limit(Number(limit))
-    .toArray();
+      const total = await orderCollection.countDocuments(filterQuery);
+      const orders = await orderCollection
+        .find(filterQuery)
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(Number(limit))
+        .toArray();
 
-  res.json({
-    success: true,
-    data: orders,
-    total,
-    page: Number(page),
-    totalPages: Math.ceil(total / limit),
-  });
+      res.json({
+        success: true,
+        data: orders,
+        total,
+        page: Number(page),
+        totalPages: Math.ceil(total / limit),
+      });
     });
     // Cancel Buyer order - Fixed endpoint path to match frontend expectation
     app.patch("/my-orders/cancel/:id", verifyFBToken, async (req, res) => {
@@ -481,12 +460,6 @@ const verifyAdminOrManager = async (req, res, next) => {
         CustomerEmail: email,
       });
 
-      if (order.status !== "pending") {
-        return res.status(400).json({
-          success: false,
-          message: "Only pending orders can be cancelled",
-        });
-      }
 
       await orderCollection.updateOne(
         { _id: new ObjectId(id) },
@@ -501,7 +474,7 @@ const verifyAdminOrManager = async (req, res, next) => {
       res.json({ success: true });
     });
 
-
+    
     //user post in database
     app.post("/users", async (req, res) => {
       const userInfo = req.body;
@@ -872,43 +845,279 @@ const verifyAdminOrManager = async (req, res, next) => {
       });
     });
 
-    //post order
-    // app.post("/orders", async (req, res) => {
-    //   const orderData = req.body;
-    //   const order = {
-    //     ...orderData,
-    //     trackingId,
-    //     status: orderData.paymentMethod === "Stripe" ? "unpaid" : "cod",
-    //     createdAt: new Date(),
-    //   };
+    // ==================== APPROVED ORDERS ENDPOINTS ====================
 
-    //   const result = await orderCollection.insertOne(order);
+    // Get approved orders with filtering (for ApprovedOrders.jsx)
+    app.put("/order/status/:id", async (req, res) => {
+      const { id } = req.params;
+      const { status, rejectionReason, approvedAt, rejectedAt } = req.body;
 
-    //   res.status(201).json({
-    //     success: true,
-    //     order: {
-    //       _id: result.insertedId,
-    //       trackingId,
-    //       totalPrice: order.totalPrice,
-    //     },
+      const updateData = { status };
 
-    //     message: "order created successfully",
-    //   });
-    // });
+      if (status === "approved") {
+        updateData.approvedAt = approvedAt || new Date();
+      }
 
-    // get all orders
+      if (status === "rejected") {
+        updateData.rejectionReason = rejectionReason;
+        updateData.rejectedAt = rejectedAt || new Date();
+      }
 
-    app.get("/orders", async (req, res) => {
-      const orders = await orderCollection
-        .find({})
-        .sort({ createdAt: -1 })
-        .toArray();
+      const updatedOrder = await Order.findByIdAndUpdate(id, updateData, {
+        new: true,
+      });
 
-      res.json({
+      if (!updatedOrder) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Order not found" });
+      }
+
+      res.status(200).json({
         success: true,
-        data: orders,
+        message: `Order ${status} successfully`,
+        data: updatedOrder,
       });
     });
+      
+      
+      
+    app.post(
+      "/orders/:id/tracking",
+      verifyFBToken,
+      verifyAdminOrManager,
+      async (req, res) => {
+          const { id } = req.params;
+          const { location, note, status, dateTime } = req.body;
+
+        
+          if (!location || !location.trim()) {
+            return res.status(400).json({
+              success: false,
+              message: "Location is required",
+            });
+          }
+
+          const order = await orderCollection.findOne({
+            _id: new ObjectId(id),
+          });
+
+          if (!order) {
+            return res.status(404).json({
+              success: false,
+              message: "Order not found",
+            });
+          }
+
+          if (!order.tracking) {
+            order.tracking = [];
+          }
+
+          const trackingEntry = {
+            location,
+            note: note || "",
+            status: status || "Cutting Completed",
+            dateTime: dateTime ? new Date(dateTime) : new Date(),
+            addedAt: new Date(),
+          };
+
+          const result = await orderCollection.updateOne(
+            { _id: new ObjectId(id) },
+            {
+              $push: { tracking: trackingEntry },
+              $set: { updatedAt: new Date() },
+            }
+          );
+
+          if (result.modifiedCount === 0) {
+            return res.status(400).json({
+              success: false,
+              message: "Failed to add tracking update",
+            });
+          }
+
+          const updatedOrder = await orderCollection.findOne({
+            _id: new ObjectId(id),
+          });
+
+          res.status(200).json({
+            success: true,
+            data: updatedOrder,
+            message: "Tracking update added successfully",
+          });
+       
+      }
+    );
+
+    app.get(
+      "/orders/pending",
+      verifyFBToken,
+      verifyAdminOrManager,
+      async (req, res) => {
+        
+          const { search, page = 1, limit = 6 } = req.query;
+          const skip = (parseInt(page) - 1) * parseInt(limit);
+
+        
+          let query = { status: "pending" };
+
+          if (search && search.trim()) {
+            const searchRegex = new RegExp(search, "i");
+            query.$or = [
+              { orderId: searchRegex },
+              { trackingId: searchRegex },
+              { "user.name": searchRegex },
+              { "user.email": searchRegex },
+              { "items.name": searchRegex },
+              { "items.product_name": searchRegex },
+            ];
+          }
+
+          const [orders, total] = await Promise.all([
+            orderCollection
+              .find(query)
+              .sort({ createdAt: -1 })
+              .skip(skip)
+              .limit(parseInt(limit))
+              .toArray(),
+            orderCollection.countDocuments(query),
+          ]);
+          const populatedOrders = await Promise.all(
+            orders.map(async (order) => {
+              if (order.CustomerEmail && !order.user) {
+                const user = await userCollection.findOne(
+                  { email: order.CustomerEmail },
+                  { projection: { name: 1, email: 1 } }
+                );
+                return { ...order, user };
+              }
+              return order;
+            })
+          );
+
+          res.status(200).json({
+            success: true,
+            data: populatedOrders,
+            total,
+            page: parseInt(page),
+            totalPages: Math.ceil(total / parseInt(limit)),
+            limit: parseInt(limit),
+          });
+      
+      }
+    );
+
+    // Update order status (approve/reject) - for PendingOrders.jsx
+    app.put(
+      "/orders/:id/status",
+      verifyFBToken,
+      verifyAdminOrManager,
+      async (req, res) => {
+       
+          const { id } = req.params;
+          const { status, approvedAt, rejectionReason } = req.body;
+
+          // Validate status
+          if (!["approved", "rejected"].includes(status)) {
+            return res.status(400).json({
+              success: false,
+              message: "Invalid status. Must be 'approved' or 'rejected'",
+            });
+          }
+
+          // Prepare update data
+          const updateData = {
+            status,
+            updatedAt: new Date(),
+          };
+
+          // Add approvedAt for approved orders
+          if (status === "approved") {
+            updateData.approvedAt = approvedAt
+              ? new Date(approvedAt)
+              : new Date();
+            updateData.approvedBy = req.decoded_email;
+          }
+
+          // Add rejectionReason for rejected orders
+          if (status === "rejected") {
+            updateData.rejectionReason =
+              rejectionReason || "Rejected by manager";
+          }
+
+          // Update the order
+          const result = await orderCollection.updateOne(
+            { _id: new ObjectId(id) },
+            { $set: updateData }
+          );
+
+          if (result.matchedCount === 0) {
+            return res.status(404).json({
+              success: false,
+              message: "Order not found",
+            });
+          }
+
+          // Get updated order
+          const updatedOrder = await orderCollection.findOne({
+            _id: new ObjectId(id),
+          });
+
+          res.status(200).json({
+            success: true,
+            data: updatedOrder,
+            message: `Order ${status} successfully`,
+          });
+      
+      }
+    );
+
+
+    app.get(
+      "/orders",
+      verifyFBToken,
+      verifyAdminOrManager,
+      async (req, res) => {
+          const { status, search, page = 1, limit = 10 } = req.query;
+          const skip = (parseInt(page) - 1) * parseInt(limit);
+
+          let query = {};
+          if (status && status !== "all") {
+            query.status = status;
+          }
+
+          if (search && search.trim()) {
+            const searchRegex = new RegExp(search, "i");
+            query.$or = [
+              { orderId: searchRegex },
+              { trackingId: searchRegex },
+              { "user.name": searchRegex },
+              { "user.email": searchRegex },
+              { "items.name": searchRegex },
+            ];
+          }
+
+          const [orders, total] = await Promise.all([
+            orderCollection
+              .find(query)
+              .sort({ createdAt: -1 })
+              .skip(skip)
+              .limit(parseInt(limit))
+              .toArray(),
+            orderCollection.countDocuments(query),
+          ]);
+
+          res.status(200).json({
+            success: true,
+            data: orders,
+            total,
+            page: parseInt(page),
+            totalPages: Math.ceil(total / parseInt(limit)),
+            limit: parseInt(limit),
+          });
+       
+      }
+    );
 
     //get product stats
     app.get("/products/stats", verifyFBToken, async (req, res) => {
@@ -1293,49 +1502,49 @@ const verifyAdminOrManager = async (req, res, next) => {
       }
     });
 
-function generateTrackingHistory(order) {
-  return [
-    {
-      step: "Cutting Completed",
-      icon: "cutting",
-      location: "Production Unit",
-      status: "completed",
-      date: order.createdAt,
-    },
-    {
-      step: "Sewing Started",
-      icon: "sewing",
-      location: "Stitching Section",
-      status: "completed",
-      date: new Date(order.createdAt.getTime() + 1 * 86400000),
-    },
-    {
-      step: "Finishing",
-      icon: "finishing",
-      location: "Finishing Unit",
-      status: "current",
-      date: new Date(order.createdAt.getTime() + 2 * 86400000),
-    },
-    {
-      step: "QC Checked",
-      icon: "qc",
-      location: "Quality Control",
-      status: "pending",
-    },
-    {
-      step: "Packed",
-      icon: "packed",
-      location: "Warehouse",
-      status: "pending",
-    },
-    {
-      step: "Shipped",
-      icon: "shipped",
-      location: "Dispatch Center",
-      status: "pending",
-    },
-  ];
-}
+    function generateTrackingHistory(order) {
+      return [
+        {
+          step: "Cutting Completed",
+          icon: "cutting",
+          location: "Production Unit",
+          status: "completed",
+          date: order.createdAt,
+        },
+        {
+          step: "Sewing Started",
+          icon: "sewing",
+          location: "Stitching Section",
+          status: "completed",
+          date: new Date(order.createdAt.getTime() + 1 * 86400000),
+        },
+        {
+          step: "Finishing",
+          icon: "finishing",
+          location: "Finishing Unit",
+          status: "current",
+          date: new Date(order.createdAt.getTime() + 2 * 86400000),
+        },
+        {
+          step: "QC Checked",
+          icon: "qc",
+          location: "Quality Control",
+          status: "pending",
+        },
+        {
+          step: "Packed",
+          icon: "packed",
+          location: "Warehouse",
+          status: "pending",
+        },
+        {
+          step: "Shipped",
+          icon: "shipped",
+          location: "Dispatch Center",
+          status: "pending",
+        },
+      ];
+    }
 
     // Update order tracking (for admin)
     app.put(
